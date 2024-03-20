@@ -72,11 +72,11 @@ func (jsProcess *JSProcess) Start() error {
 		jsProcess.StdOut = bufio.NewReader(stdout)
 		jsProcess.IsBusy = false
 
-		jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Started process with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
 		if err := jsProcess.Cmd.Start(); err != nil {
 			jsProcess.Manager.Logger.Error().Msgf("[minerva|%s] Error starting process with id %d: %s", jsProcess.Name, jsProcess.Id, err.Error())
 			return err
 		}
+		jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Started process with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
 	} else {
 		jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Process with id %d is already running", jsProcess.Name, jsProcess.Id)
 	}
