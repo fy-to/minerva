@@ -63,7 +63,7 @@ func (jsProcess *JSProcess) Stop() error {
 func (jsProcess *JSProcess) Start() error {
 	jsProcess.Manager.Mu.Lock()
 	defer jsProcess.Manager.Mu.Unlock()
-	if jsProcess.Cmd == nil {
+	if jsProcess.Cmd == nil || jsProcess.Cmd.ProcessState == nil || jsProcess.Cmd.ProcessState.Exited() {
 		cmd := exec.Command(jsProcess.NodeCmd, "--experimental-default-type=module", jsProcess.NodeFile)
 		stdin, _ := cmd.StdinPipe()
 		stdout, _ := cmd.StdoutPipe()
@@ -88,9 +88,8 @@ func (jsProcess *JSProcess) Start() error {
 // If an error occurs during the stop or start process, it will be returned.
 // Returns nil if the restart is successful.
 func (jsProcess *JSProcess) Restart() error {
-	if err := jsProcess.Stop(); err != nil {
-		return err
-	}
+	jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Restarting process with id %d", jsProcess.Name, jsProcess.Id)
+	jsProcess.Stop()
 
 	if err := jsProcess.Start(); err != nil {
 		return err

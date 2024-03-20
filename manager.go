@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -110,17 +111,41 @@ func (jsm *JSManager) StopAllNodes() {
 // It checks each process in the pool and returns the first process that is not busy and running.
 // If no available process is found within the specified timeout, it returns an error.
 func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error) {
+	var keepChecking int32 = 1 // Use an int32 for atomic operations
 	jsm.Mu.Lock()
 	defer jsm.Mu.Unlock()
-	for _, process := range jsm.Nodes[processName] {
-		jsm.Logger.Debug().Msgf("[minerva|%s] checking process %d - %t", processName, process.Id, process.IsBusy)
-		if !process.IsBusy && process.Cmd != nil {
-			process.IsBusy = true
-			return process, nil
+
+	processChan := make(chan *JSProcess, 1)
+	quitChan := make(chan bool)
+
+	go func() {
+		for atomic.LoadInt32(&keepChecking) != 0 {
+			select {
+			case <-quitChan:
+				return
+			default:
+				for _, process := range jsm.Nodes[processName] {
+					if !process.IsBusy && process.Cmd != nil {
+						process.IsBusy = true
+						processChan <- process
+						return
+					}
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
+	}()
+
+	select {
+	case process := <-processChan:
+		atomic.StoreInt32(&keepChecking, 0)
+		close(quitChan)
+		return process, nil
+	case <-time.After(250 * time.Millisecond):
+		atomic.StoreInt32(&keepChecking, 0)
+		close(quitChan)
+		return nil, fmt.Errorf("[minerva] no available process")
 	}
-	jsm.Logger.Info().Msgf("[minerva|%s] no available process", processName)
-	return nil, fmt.Errorf("[minerva] no available process")
 }
 
 // ExecuteJSCode executes the given JavaScript code on a specific process.
@@ -147,4 +172,3 @@ func (jsm *JSManager) ExecuteJSCode(jsCode string, processName string) (map[stri
 		return nil, fmt.Errorf("[minerva] execution timed out")
 	}
 }
-
