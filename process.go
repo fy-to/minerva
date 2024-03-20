@@ -12,56 +12,65 @@ import (
 )
 
 type JSProcess struct {
-	cmd       *exec.Cmd
-	stdin     *bufio.Writer
-	stdout    *bufio.Reader
-	name      string
-	nodeCmd   string
-	createdAt int64
-	busy      bool
-	id        int
-	args      *[]interface{}
-	setupFunc *SetupFunction
-	nodeFile  string
-	separator string
-	timeout   int
+	Cmd       *exec.Cmd
+	StdIn     *bufio.Writer
+	StdOut    *bufio.Reader
+	Name      string
+	NodeCmd   string
+	CreatedAt int64
+	IsBusy    bool
+	Id        int
+	Args      *[]interface{}
+	SetupFunc *SetupFunction
+	NodeFile  string
+	Separator string
+	Timeout   int
+	Manager   *JSManager
 }
 type JSResponse struct {
-	Success     bool                   `json:"success"`
-	Data        map[string]interface{} `json:"data"`
-	Error       string                 `json:"error"`
-	ActualError error                  `json:"-"`
+	Success bool                   `json:"success"`
+	Data    map[string]interface{} `json:"data"`
+	Error   string                 `json:"error"`
+	GoError error                  `json:"-"`
 }
 
 func (jsProcess *JSProcess) Stop() error {
-	if jsProcess.cmd != nil && jsProcess.cmd.ProcessState != nil && !jsProcess.cmd.ProcessState.Exited() {
-		jsProcess.stdin = nil
-		jsProcess.stdout = nil
-		jsProcess.cmd.Process.Signal(os.Interrupt)
-		jsProcess.cmd.Process.Kill()
-		jsProcess.cmd.Wait()
-		jsProcess.cmd.Process.Release()
-		jsProcess.cmd = nil
-		jsProcess.busy = true
+	jsProcess.Manager.Mu.Lock()
+	defer jsProcess.Manager.Mu.Unlock()
+	if jsProcess.Cmd != nil && jsProcess.Cmd.ProcessState != nil && !jsProcess.Cmd.ProcessState.Exited() {
+		jsProcess.StdIn = nil
+		jsProcess.StdOut = nil
+		jsProcess.Cmd.Process.Signal(os.Interrupt)
+		jsProcess.Cmd.Process.Kill()
+		jsProcess.Cmd.Wait()
+
+		jsProcess.Manager.Logger.Info().Msgf("[minerva] Stopped process %s with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
+		jsProcess.Cmd.Process.Release()
+		jsProcess.Cmd = nil
+		jsProcess.IsBusy = true
 	}
 
 	return nil
 }
 
 func (jsProcess *JSProcess) Start() error {
-	if jsProcess.cmd == nil {
-		cmd := exec.Command(jsProcess.nodeCmd, "--experimental-default-type=module", jsProcess.nodeFile)
+	jsProcess.Manager.Mu.Lock()
+	defer jsProcess.Manager.Mu.Unlock()
+	if jsProcess.Cmd == nil {
+		cmd := exec.Command(jsProcess.NodeCmd, "--experimental-default-type=module", jsProcess.NodeFile)
 		stdin, _ := cmd.StdinPipe()
 		stdout, _ := cmd.StdoutPipe()
-		jsProcess.cmd = cmd
-		jsProcess.stdin = bufio.NewWriter(stdin)
-		jsProcess.stdout = bufio.NewReader(stdout)
-		jsProcess.busy = false
+		jsProcess.Cmd = cmd
+		jsProcess.StdIn = bufio.NewWriter(stdin)
+		jsProcess.StdOut = bufio.NewReader(stdout)
+		jsProcess.IsBusy = false
 	}
 
-	if err := jsProcess.cmd.Start(); err != nil {
+	if err := jsProcess.Cmd.Start(); err != nil {
 		return err
 	}
+	jsProcess.Manager.Logger.Info().Msgf("[minerva] Started process %s with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
+
 	return nil
 }
 
@@ -78,37 +87,37 @@ func (jsProcess *JSProcess) Restart() error {
 }
 
 func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan JSResponse) {
-	_, err := jsProcess.stdin.WriteString(jsCode + "\n")
+	_, err := jsProcess.StdIn.WriteString(jsCode + "\n")
 	if err != nil {
 		jsProcess.Restart()
 
 		resultChan <- JSResponse{
-			Success:     false,
-			Data:        nil,
-			Error:       "error writing to stdin",
-			ActualError: fmt.Errorf("[minerva] error writing to stdin: %s", err.Error()),
+			Success: false,
+			Data:    nil,
+			Error:   "error writing to stdin",
+			GoError: fmt.Errorf("[minerva] [%s] error writing to stdin: %s", jsProcess.Name, err.Error()),
 		}
 		return
 	}
-	jsProcess.stdin.Flush()
+	jsProcess.StdIn.Flush()
 	var buffer bytes.Buffer
 	var tempBuffer bytes.Buffer
 
 	for {
 		chunk := make([]byte, 4096)
-		n, err := jsProcess.stdout.Read(chunk)
+		n, err := jsProcess.StdOut.Read(chunk)
 		if err != nil && err != io.EOF {
 			resultChan <- JSResponse{
-				Success:     false,
-				Data:        nil,
-				Error:       "error reading from stdout",
-				ActualError: fmt.Errorf("[minerva] error reading from stdout: %s", err.Error()),
+				Success: false,
+				Data:    nil,
+				Error:   "error reading from stdout",
+				GoError: fmt.Errorf("[minerva] [%s] error reading from stdout: %s", jsProcess.Name, err.Error()),
 			}
 			return
 		}
 		tempBuffer.Write(chunk[:n])
-		if strings.Contains(tempBuffer.String(), jsProcess.separator) {
-			parts := strings.Split(tempBuffer.String(), jsProcess.separator)
+		if strings.Contains(tempBuffer.String(), jsProcess.Separator) {
+			parts := strings.Split(tempBuffer.String(), jsProcess.Separator)
 			buffer.WriteString(parts[0])
 			tempBuffer.Reset()
 			if len(parts) > 1 {
@@ -124,10 +133,10 @@ func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan
 	err = json.Unmarshal(buffer.Bytes(), &response)
 	if err != nil {
 		resultChan <- JSResponse{
-			Success:     false,
-			Data:        nil,
-			Error:       "error unmarshalling response",
-			ActualError: fmt.Errorf("[minerva] error unmarshalling response: %s", err.Error()),
+			Success: false,
+			Data:    nil,
+			Error:   "error unmarshalling response",
+			GoError: fmt.Errorf("[minerva] [%s] error unmarshalling response: %s", jsProcess.Name, err.Error()),
 		}
 		return
 	}

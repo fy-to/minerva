@@ -1,26 +1,28 @@
 package minerva
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 type JSManager struct {
-	mu    sync.Mutex
-	nodes map[string]map[int]*JSProcess
+	Mu     sync.Mutex
+	Nodes  map[string]map[int]*JSProcess
+	Logger *zerolog.Logger
 }
 
-func NewNodeManager() *JSManager {
+func NewNodeManager(logger zerolog.Logger) *JSManager {
 	return &JSManager{
-		nodes: make(map[string]map[int]*JSProcess),
+		Nodes:  make(map[string]map[int]*JSProcess),
+		Logger: &logger,
 	}
 }
 
-type SetupFunction func(...interface{}) (string, error)
+type SetupFunction func([]interface{}) (string, error)
 
 func (jsm *JSManager) StartProcess(
 	id int,
@@ -34,7 +36,7 @@ func (jsm *JSManager) StartProcess(
 	args *[]interface{},
 ) error {
 	if _, err := os.Stat(nodeFile); os.IsNotExist(err) || forceSetup {
-		fileContent, err := setupFunction(*args...)
+		fileContent, err := setupFunction(*args)
 		if err != nil {
 			return err
 		}
@@ -43,62 +45,56 @@ func (jsm *JSManager) StartProcess(
 			return err
 		}
 	}
-	cmd := exec.Command(nodeCmd, "--experimental-default-type=module", nodeFile)
-	stdin, _ := cmd.StdinPipe()
-	stdout, _ := cmd.StdoutPipe()
+
 	jsProcess := &JSProcess{
-		cmd:       cmd,
-		stdin:     bufio.NewWriter(stdin),
-		stdout:    bufio.NewReader(stdout),
-		name:      processName,
-		nodeCmd:   nodeCmd,
-		createdAt: time.Now().Unix(),
-		id:        id,
-		busy:      false,
-		args:      args,
-		setupFunc: &setupFunction,
-		nodeFile:  nodeFile,
-		separator: separator,
-		timeout:   timeout,
+		Name:      processName,
+		NodeCmd:   nodeCmd,
+		CreatedAt: time.Now().Unix(),
+		Id:        id,
+		IsBusy:    true,
+		Args:      args,
+		SetupFunc: &setupFunction,
+		NodeFile:  nodeFile,
+		Separator: separator,
+		Timeout:   timeout,
+		Manager:   jsm,
 	}
 
-	jsm.mu.Lock()
-	if _, ok := jsm.nodes[processName]; !ok {
-		jsm.nodes[processName] = make(map[int]*JSProcess)
+	jsm.Mu.Lock()
+	if _, ok := jsm.Nodes[processName]; !ok {
+		jsm.Nodes[processName] = make(map[int]*JSProcess)
 	}
-	jsm.nodes[processName][id] = jsProcess
-	jsm.nodes[processName][id].Start()
-	jsm.mu.Unlock()
+	jsm.Nodes[processName][id] = jsProcess
+	jsm.Mu.Unlock()
+	jsm.Nodes[processName][id].Start()
 
 	return nil
 }
 
 func (jsm *JSManager) RestartAllNodesByName(processName string) {
-	jsm.mu.Lock()
-	if _, ok := jsm.nodes[processName]; ok {
-		for _, jsProcess := range jsm.nodes[processName] {
+	jsm.Mu.Lock()
+	if _, ok := jsm.Nodes[processName]; ok {
+		for _, jsProcess := range jsm.Nodes[processName] {
 			jsProcess.Stop()
 		}
 	}
-	jsm.mu.Unlock()
+	jsm.Mu.Unlock()
 
-	for _, jsProcess := range jsm.nodes[processName] {
+	for _, jsProcess := range jsm.Nodes[processName] {
 		jsProcess.Start()
 	}
 }
 func (jsm *JSManager) CountAllNodes() int {
-	jsm.mu.Lock()
-	defer jsm.mu.Unlock()
+	jsm.Mu.Lock()
+	defer jsm.Mu.Unlock()
 	count := 0
-	for _, process := range jsm.nodes {
+	for _, process := range jsm.Nodes {
 		count += len(process)
 	}
 	return count
 }
 func (jsm *JSManager) StopAllNodes() {
-	jsm.mu.Lock()
-	defer jsm.mu.Unlock()
-	for _, process := range jsm.nodes {
+	for _, process := range jsm.Nodes {
 		for _, jsProcess := range process {
 			jsProcess.Stop()
 		}
@@ -109,10 +105,9 @@ func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error)
 	processResult := make(chan *JSProcess, 1)
 
 	go func() {
-		jsm.mu.Lock()
-		defer jsm.mu.Unlock()
-		for _, process := range jsm.nodes[processName] {
-			if !process.busy && process.cmd != nil {
+		for _, process := range jsm.Nodes[processName] {
+			jsm.Logger.Debug().Msgf("[minerva] [%s] checking process %d - %t", processName, process.Id, process.IsBusy)
+			if !process.IsBusy && process.Cmd != nil {
 				processResult <- process
 				return
 			}
@@ -122,30 +117,31 @@ func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error)
 	case process := <-processResult:
 		return process, nil
 	case <-time.After(500 * time.Millisecond):
+		jsm.Logger.Info().Msgf("[minerva] [%s] no available process", processName)
 		return nil, fmt.Errorf("[minerva] no available process")
 	}
 }
-func (jsm *JSManager) ExecuteJSCode(ctx *interface{}, jsCode, websiteUUID string) (map[string]interface{}, error) {
-	jsm.mu.Lock()
-	process, err := jsm.GetProcessFromPool(websiteUUID)
+func (jsm *JSManager) ExecuteJSCode(jsCode string, processName string) (map[string]interface{}, error) {
+	jsm.Mu.Lock()
+	process, err := jsm.GetProcessFromPool(processName)
 	if err != nil {
+		jsm.Mu.Unlock()
 		return nil, err
 	}
-	process.busy = true
-	jsm.mu.Unlock()
+	process.IsBusy = true
+	jsm.Mu.Unlock()
 
 	resultChan := make(chan JSResponse, 1)
 	go process.executeJSCodeInternal(jsCode, resultChan)
 	select {
 	case res := <-resultChan:
-		jsm.mu.Lock()
-		defer jsm.mu.Unlock()
-		process.busy = false
-		return res.Data, res.ActualError
-	case <-time.After(time.Duration(process.timeout) * time.Second):
-		jsm.mu.Lock()
-		defer jsm.mu.Unlock()
+		jsm.Mu.Lock()
+		defer jsm.Mu.Unlock()
+		process.IsBusy = false
+		return res.Data, res.GoError
+	case <-time.After(time.Duration(process.Timeout) * time.Second):
 		go process.Restart()
+		jsm.Logger.Info().Msgf("[minerva] [%s] execution timed out", processName)
 		return nil, fmt.Errorf("[minerva] execution timed out")
 	}
 }
