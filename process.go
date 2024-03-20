@@ -34,6 +34,10 @@ type JSResponse struct {
 	GoError error                  `json:"-"`
 }
 
+// Stop stops the JSProcess by sending an interrupt signal and killing the process.
+// It releases the process resources and sets the Cmd to nil.
+// If the process is already stopped or has exited, it does nothing.
+// It returns an error if there was an issue stopping the process.
 func (jsProcess *JSProcess) Stop() error {
 	jsProcess.Manager.Mu.Lock()
 	defer jsProcess.Manager.Mu.Unlock()
@@ -53,6 +57,10 @@ func (jsProcess *JSProcess) Stop() error {
 	return nil
 }
 
+// Start starts the JSProcess by executing the specified Node.js command with the given file.
+// It acquires a lock on the JSProcess manager, sets up the command, pipes for stdin and stdout,
+// and starts the command. If an error occurs during the process startup, it logs the error and returns it.
+// Otherwise, it returns nil.
 func (jsProcess *JSProcess) Start() error {
 	jsProcess.Manager.Mu.Lock()
 	defer jsProcess.Manager.Mu.Unlock()
@@ -65,15 +73,18 @@ func (jsProcess *JSProcess) Start() error {
 		jsProcess.StdOut = bufio.NewReader(stdout)
 		jsProcess.IsBusy = false
 	}
-
+	jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Started process with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
 	if err := jsProcess.Cmd.Start(); err != nil {
+		jsProcess.Manager.Logger.Error().Msgf("[minerva|%s] Error starting process with id %d: %s", jsProcess.Name, jsProcess.Id, err.Error())
 		return err
 	}
-	jsProcess.Manager.Logger.Info().Msgf("[minerva] Started process %s with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
 
 	return nil
 }
 
+// Restart restarts the JSProcess by first stopping it and then starting it again.
+// If an error occurs during the stop or start process, it will be returned.
+// Returns nil if the restart is successful.
 func (jsProcess *JSProcess) Restart() error {
 	if err := jsProcess.Stop(); err != nil {
 		return err
@@ -86,6 +97,12 @@ func (jsProcess *JSProcess) Restart() error {
 	return nil
 }
 
+// executeJSCodeInternal executes the given JavaScript code in the JSProcess instance and sends the result through the resultChan channel.
+// If there is an error writing to stdin or reading from stdout, the JSResponse with the corresponding error message is sent.
+// The function reads the output from stdout until it finds the separator defined in the JSProcess instance.
+// It then splits the output into two parts, appends the first part to the buffer, and stores the second part in the tempBuffer.
+// If the end of the output is reached (EOF), the tempBuffer is appended to the buffer.
+// The buffer is then unmarshalled into a JSResponse struct and sent through the resultChan channel.
 func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan JSResponse) {
 	_, err := jsProcess.StdIn.WriteString(jsCode + "\n")
 	if err != nil {
@@ -95,7 +112,7 @@ func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan
 			Success: false,
 			Data:    nil,
 			Error:   "error writing to stdin",
-			GoError: fmt.Errorf("[minerva] [%s] error writing to stdin: %s", jsProcess.Name, err.Error()),
+			GoError: fmt.Errorf("[minerva|%s] error writing to stdin: %s", jsProcess.Name, err.Error()),
 		}
 		return
 	}
@@ -111,7 +128,7 @@ func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan
 				Success: false,
 				Data:    nil,
 				Error:   "error reading from stdout",
-				GoError: fmt.Errorf("[minerva] [%s] error reading from stdout: %s", jsProcess.Name, err.Error()),
+				GoError: fmt.Errorf("[minerva|%s] error reading from stdout: %s", jsProcess.Name, err.Error()),
 			}
 			return
 		}
@@ -136,7 +153,7 @@ func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan
 			Success: false,
 			Data:    nil,
 			Error:   "error unmarshalling response",
-			GoError: fmt.Errorf("[minerva] [%s] error unmarshalling response: %s", jsProcess.Name, err.Error()),
+			GoError: fmt.Errorf("[minerva|%s] error unmarshalling response: %s", jsProcess.Name, err.Error()),
 		}
 		return
 	}

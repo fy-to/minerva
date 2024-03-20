@@ -15,6 +15,9 @@ type JSManager struct {
 	Logger *zerolog.Logger
 }
 
+// NewNodeManager creates a new instance of JSManager, which manages the nodes and processes.
+// It takes a logger of type zerolog.Logger as a parameter.
+// Returns a pointer to the newly created JSManager.
 func NewNodeManager(logger zerolog.Logger) *JSManager {
 	return &JSManager{
 		Nodes:  make(map[string]map[int]*JSProcess),
@@ -24,6 +27,18 @@ func NewNodeManager(logger zerolog.Logger) *JSManager {
 
 type SetupFunction func([]interface{}) (string, error)
 
+// StartProcess starts a new process in the JSManager.
+// It takes the following parameters:
+// - id: the ID of the process
+// - processName: the name of the process (websiteUUID, for example)
+// - nodeFile: the file path of the node file to be executed
+// - nodeCmd: the command to execute the node file (node, bun or any JS runtime)
+// - separator: the separator used in the node file to separate the output (e.g '\n')
+// - timeout: the timeout duration in seconds for one execution of the process
+// - forceSetup: a flag indicating whether to force the setup function to be executed (should call the setup function, to update the node file if needed)
+// - setupFunction: the setup function to be executed if the node file does not exist or forceSetup is true (should return the content of the node file)
+// - args: the arguments to be passed to the setup function (can be nil, used for setup function)
+// It returns an error if any error occurs during the setup or execution of the process.
 func (jsm *JSManager) StartProcess(
 	id int,
 	processName string,
@@ -71,6 +86,7 @@ func (jsm *JSManager) StartProcess(
 	return nil
 }
 
+// CountAllNodes compte le nombre total de nœuds dans le gestionnaire JSManager.
 func (jsm *JSManager) CountAllNodes() int {
 	jsm.Mu.Lock()
 	defer jsm.Mu.Unlock()
@@ -80,6 +96,8 @@ func (jsm *JSManager) CountAllNodes() int {
 	}
 	return count
 }
+
+// StopAllNodes arrête tous les nœuds gérés par le JSManager.
 func (jsm *JSManager) StopAllNodes() {
 	for _, process := range jsm.Nodes {
 		for _, jsProcess := range process {
@@ -88,12 +106,15 @@ func (jsm *JSManager) StopAllNodes() {
 	}
 }
 
+// GetProcessFromPool retrieves an available JSProcess from the pool for a given process name.
+// It checks each process in the pool and returns the first process that is not busy and running.
+// If no available process is found within the specified timeout, it returns an error.
 func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error) {
 	processResult := make(chan *JSProcess, 1)
 
 	go func() {
 		for _, process := range jsm.Nodes[processName] {
-			jsm.Logger.Debug().Msgf("[minerva] [%s] checking process %d - %t", processName, process.Id, process.IsBusy)
+			jsm.Logger.Debug().Msgf("[minerva|%s] checking process %d - %t", processName, process.Id, process.IsBusy)
 			if !process.IsBusy && process.Cmd != nil {
 				processResult <- process
 				return
@@ -104,10 +125,15 @@ func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error)
 	case process := <-processResult:
 		return process, nil
 	case <-time.After(500 * time.Millisecond):
-		jsm.Logger.Info().Msgf("[minerva] [%s] no available process", processName)
+		jsm.Logger.Info().Msgf("[minerva|%s] no available process", processName)
 		return nil, fmt.Errorf("[minerva] no available process")
 	}
 }
+
+// ExecuteJSCode executes the given JavaScript code on a specific process.
+// It acquires a process from the process pool, marks it as busy, and then executes the code.
+// If the execution times out, the process is restarted.
+// It returns the result of the execution as a map[string]interface{} and any error encountered.
 func (jsm *JSManager) ExecuteJSCode(jsCode string, processName string) (map[string]interface{}, error) {
 	jsm.Mu.Lock()
 	process, err := jsm.GetProcessFromPool(processName)
@@ -128,7 +154,7 @@ func (jsm *JSManager) ExecuteJSCode(jsCode string, processName string) (map[stri
 		return res.Data, res.GoError
 	case <-time.After(time.Duration(process.Timeout) * time.Second):
 		go process.Restart()
-		jsm.Logger.Info().Msgf("[minerva] [%s] execution timed out", processName)
+		jsm.Logger.Info().Msgf("[minerva|%s] execution timed out", processName)
 		return nil, fmt.Errorf("[minerva] execution timed out")
 	}
 }
