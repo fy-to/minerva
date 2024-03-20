@@ -110,24 +110,17 @@ func (jsm *JSManager) StopAllNodes() {
 // It checks each process in the pool and returns the first process that is not busy and running.
 // If no available process is found within the specified timeout, it returns an error.
 func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error) {
-	processResult := make(chan *JSProcess, 1)
-
-	go func() {
-		for _, process := range jsm.Nodes[processName] {
-			jsm.Logger.Debug().Msgf("[minerva|%s] checking process %d - %t", processName, process.Id, process.IsBusy)
-			if !process.IsBusy && process.Cmd != nil {
-				processResult <- process
-				return
-			}
+	jsm.Mu.Lock()
+	defer jsm.Mu.Unlock()
+	for _, process := range jsm.Nodes[processName] {
+		jsm.Logger.Debug().Msgf("[minerva|%s] checking process %d - %t", processName, process.Id, process.IsBusy)
+		if !process.IsBusy && process.Cmd != nil {
+			process.IsBusy = true
+			return process, nil
 		}
-	}()
-	select {
-	case process := <-processResult:
-		return process, nil
-	case <-time.After(500 * time.Millisecond):
-		jsm.Logger.Info().Msgf("[minerva|%s] no available process", processName)
-		return nil, fmt.Errorf("[minerva] no available process")
 	}
+	jsm.Logger.Info().Msgf("[minerva|%s] no available process", processName)
+	return nil, fmt.Errorf("[minerva] no available process")
 }
 
 // ExecuteJSCode executes the given JavaScript code on a specific process.
@@ -135,14 +128,10 @@ func (jsm *JSManager) GetProcessFromPool(processName string) (*JSProcess, error)
 // If the execution times out, the process is restarted.
 // It returns the result of the execution as a map[string]interface{} and any error encountered.
 func (jsm *JSManager) ExecuteJSCode(jsCode string, processName string) (map[string]interface{}, error) {
-	jsm.Mu.Lock()
 	process, err := jsm.GetProcessFromPool(processName)
 	if err != nil {
-		jsm.Mu.Unlock()
 		return nil, err
 	}
-	process.IsBusy = true
-	jsm.Mu.Unlock()
 
 	resultChan := make(chan JSResponse, 1)
 	go process.executeJSCodeInternal(jsCode, resultChan)

@@ -49,7 +49,6 @@ func (jsProcess *JSProcess) Stop() error {
 		jsProcess.Cmd.Wait()
 
 		jsProcess.Manager.Logger.Info().Msgf("[minerva] Stopped process %s with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
-		jsProcess.Cmd.Process.Release()
 		jsProcess.Cmd = nil
 		jsProcess.IsBusy = true
 	}
@@ -72,11 +71,14 @@ func (jsProcess *JSProcess) Start() error {
 		jsProcess.StdIn = bufio.NewWriter(stdin)
 		jsProcess.StdOut = bufio.NewReader(stdout)
 		jsProcess.IsBusy = false
-	}
-	jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Started process with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
-	if err := jsProcess.Cmd.Start(); err != nil {
-		jsProcess.Manager.Logger.Error().Msgf("[minerva|%s] Error starting process with id %d: %s", jsProcess.Name, jsProcess.Id, err.Error())
-		return err
+
+		jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Started process with id %d (pid: %d)", jsProcess.Name, jsProcess.Id, jsProcess.Cmd.Process.Pid)
+		if err := jsProcess.Cmd.Start(); err != nil {
+			jsProcess.Manager.Logger.Error().Msgf("[minerva|%s] Error starting process with id %d: %s", jsProcess.Name, jsProcess.Id, err.Error())
+			return err
+		}
+	} else {
+		jsProcess.Manager.Logger.Info().Msgf("[minerva|%s] Process with id %d is already running", jsProcess.Name, jsProcess.Id)
 	}
 
 	return nil
@@ -149,6 +151,7 @@ func (jsProcess *JSProcess) executeJSCodeInternal(jsCode string, resultChan chan
 	var response JSResponse
 	err = json.Unmarshal(buffer.Bytes(), &response)
 	if err != nil {
+		go jsProcess.Restart()
 		resultChan <- JSResponse{
 			Success: false,
 			Data:    nil,
