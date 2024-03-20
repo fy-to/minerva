@@ -71,18 +71,6 @@ func (jsm *JSManager) StartProcess(
 	return nil
 }
 
-func (jsm *JSManager) RestartAllNodesByName(processName string) {
-	if _, ok := jsm.Nodes[processName]; ok {
-		for _, jsProcess := range jsm.Nodes[processName] {
-			jsProcess.Stop()
-		}
-	}
-
-	for _, jsProcess := range jsm.Nodes[processName] {
-		jsm.Logger.Info().Msgf("[minerva] [%s] restarting process %d", processName, jsProcess.Id)
-		jsm.StartProcess(jsProcess.Id, processName, jsProcess.NodeFile, jsProcess.NodeCmd, jsProcess.Separator, jsProcess.Timeout, true, *jsProcess.SetupFunc, jsProcess.Args)
-	}
-}
 func (jsm *JSManager) CountAllNodes() int {
 	jsm.Mu.Lock()
 	defer jsm.Mu.Unlock()
