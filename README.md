@@ -41,10 +41,19 @@ For example:
     	if websiteData == nil || website == nil {
     		return
     	}
+        args := []interface{}{website, websiteData}
+
     	for i := 0; i < website.SSRInstances; i++ {
-    		args := []interface{}{website, websiteData}
-    
-    		MinervaManager.StartProcess(i, website.UUID, filepath.Join(websiteData.Env, "fws_ssr.js"), "node", "􀀂", 3, true, SetupFunction, &args)
+    		MinervaManager.StartProcess(
+                i,
+                website.UUID,
+                filepath.Join(websiteData.Env, "fws_ssr.js"),
+                "node",
+                "\n", 3,
+                true,
+                SetupFunction,
+                &args
+            )
     	}
     }
 ```
