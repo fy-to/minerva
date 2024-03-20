@@ -22,7 +22,10 @@ For example:
     func SetupFunction(args []interface{}) (string, error) {
     	website := args[0].(*realm.Website)
     	websiteData := args[1].(*WebsiteData)
-    	content, err := helpers.GetTemplateResult("ssr", &map[string]interface{}{"Req": websiteData.Config.SSRBundlePath, "Domain": website.Domain})
+    	content, err := helpers.GetTemplateResult("ssr", &map[string]interface{}{
+            "Req": websiteData.Config.SSRBundlePath,
+            "Domain": website.Domain
+        })
     	if err != nil {
     		helpers.Logger.Error().Err(err).Msg("Error getting SSR template")
     		return "", err
