@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,29 +16,31 @@ import (
 )
 
 type Process struct {
-	cmd           *exec.Cmd
-	inputQueue    chan map[string]interface{}
-	outputQueue   chan map[string]interface{}
-	isReady       bool
-	lastHeartbeat time.Time
-	latency       int64
-	mutex         sync.RWMutex
-	logger        *zerolog.Logger
-	stdin         *json.Encoder
-	stdout        *bufio.Scanner
-	name          string
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
+	cmd          *exec.Cmd
+	inputQueue   chan map[string]interface{}
+	outputQueue  chan map[string]interface{}
+	isReady      int32
+	latency      int64
+	mutex        sync.RWMutex
+	logger       *zerolog.Logger
+	stdin        *json.Encoder
+	stdout       *bufio.Scanner
+	name         string
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	cmdStr       string
+	cmdArgs      []string
+	timeout      int
+	waitResponse sync.Map
 }
 
 type ProcessExport struct {
-	IsReady       bool  `json:"isReady"`
-	LastHeartbeat int64 `json:"lastHeartbeat"`
-	Latency       int64 `json:"latency"`
-	InputQueue    int   `json:"inputQueue"`
-	OutputQueue   int   `json:"outputQueue"`
-	Name          string
+	IsReady     bool  `json:"isReady"`
+	Latency     int64 `json:"latency"`
+	InputQueue  int   `json:"inputQueue"`
+	OutputQueue int   `json:"outputQueue"`
+	Name        string
 }
 
 // Start starts the process.
@@ -48,15 +51,32 @@ type ProcessExport struct {
 // It logs an info message when the process is successfully started.
 // It spawns three goroutines to run the reader, writer, and heartbeat functions.
 func (p *Process) Start() {
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.logger.Warn().Msgf("[minerva|%s] Process already running", p.name)
+	p.SetReady(0)
+	_cmd := exec.Command(p.cmdStr, p.cmdArgs...)
+	stdin, err := _cmd.StdinPipe()
+	if err != nil {
+		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to get stdin pipe for process", p.name)
 		return
 	}
-	p.SetReady(false)
+	stdout, err := _cmd.StdoutPipe()
+	if err != nil {
+		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to get stdout pipe for process", p.name)
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	p.mutex.Lock()
+	p.cmd = _cmd
+	p.stdin = json.NewEncoder(stdin)
+	p.stdout = bufio.NewScanner(stdout)
+	p.inputQueue = make(chan map[string]interface{}, 100)
+	p.outputQueue = make(chan map[string]interface{}, 100)
 	p.ctx = ctx
 	p.cancel = cancel
 	p.wg = sync.WaitGroup{}
+	p.waitResponse = sync.Map{}
+	p.wg.Add(2)
+	p.mutex.Unlock()
 
 	if err := p.cmd.Start(); err != nil {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to start process", p.name)
@@ -64,17 +84,13 @@ func (p *Process) Start() {
 	}
 
 	p.logger.Info().Msgf("[minerva|%s] Process started", p.name)
-	p.wg.Add(3)
+
 	go func() {
 		p.runReader()
 		p.wg.Done()
 	}()
 	go func() {
 		p.runWriter()
-		p.wg.Done()
-	}()
-	go func() {
-		go p.runHeartbeat()
 		p.wg.Done()
 	}()
 }
@@ -87,13 +103,15 @@ func (p *Process) Start() {
 // It logs a message indicating that the process has stopped.
 func (p *Process) Stop() {
 
-	p.SetReady(false)
+	p.SetReady(0)
 	p.mutex.Lock()
-	defer p.mutex.Unlock()
 	p.cancel()
+	p.mutex.Unlock()
 	p.wg.Wait()
+	p.mutex.Lock()
 	close(p.inputQueue)
 	close(p.outputQueue)
+	p.mutex.Unlock()
 	if p.cmd.Process != nil {
 		p.cmd.Process.Signal(syscall.SIGINT)
 		select {
@@ -105,9 +123,13 @@ func (p *Process) Stop() {
 			// Process stopped
 		}
 	}
-	p.cmd = nil
+	p.cmd.Process.Release()
+
+	p.mutex.Lock()
 	p.stdin = nil
 	p.stdout = nil
+	p.cmd = nil
+	p.mutex.Unlock()
 	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
 }
 
@@ -120,10 +142,8 @@ func (p *Process) Restart() {
 // SetReady sets the readiness of the process.
 // If ready is true, the process is marked as ready.
 // If ready is false, the process is marked as not ready.
-func (p *Process) SetReady(ready bool) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.isReady = ready
+func (p *Process) SetReady(ready int32) {
+	atomic.StoreInt32(&p.isReady, ready)
 }
 
 // runWriter is a goroutine that continuously reads commands from the inputQueue and sends them to the process's stdin.
@@ -135,10 +155,16 @@ func (p *Process) runWriter() {
 			// Process stopped
 			return
 		case cmd := <-p.inputQueue:
+			// Send command
 			if err := p.stdin.Encode(cmd); err != nil {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
 				p.Restart()
+				continue
 			}
+			id := cmd["id"].(string)
+			ch, _ := p.waitResponse.Load(id)
+			<-ch.(chan bool)
+			p.waitResponse.Delete(id)
 		}
 	}
 }
@@ -175,44 +201,16 @@ func (p *Process) runReader() {
 
 			if msg["type"] == "ready" {
 				p.logger.Info().Msgf("[minerva|%s] Process is ready", p.name)
-				p.SetReady(true)
+				p.SetReady(1)
 			}
 
 			if msg["type"] == "success" || msg["type"] == "error" {
+				id := msg["id"].(string)
+				if ch, ok := p.waitResponse.Load(id); ok {
+					ch.(chan bool) <- true
+				}
 				p.outputQueue <- msg
 			}
-		}
-	}
-}
-
-// runHeartbeat is a method that runs the heartbeat functionality for a Process.
-// It sends a heartbeat command to the inputQueue and waits for a response from the outputQueue.
-// If a response is received within the timeout period, it updates the latency of the Process.
-// If no response is received within the timeout period, it logs an error and restarts the Process.
-func (p *Process) runHeartbeat() {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		default:
-			p.mutex.RLock()
-			if p.isReady {
-				p.lastHeartbeat = time.Now()
-				startTime := time.Now().UnixMilli()
-				cmd := map[string]interface{}{"type": "heartbeat", "id": uuid.New().String()}
-				_, err := p.SendCommand(cmd)
-				if err != nil {
-					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send heartbeat", p.name)
-					p.Restart()
-				} else {
-					endTime := time.Now().UnixMilli()
-					p.latency = endTime - startTime
-					p.logger.Debug().Msgf("[minerva|%s] Latency: %dms", p.name, p.latency)
-				}
-
-			}
-			p.mutex.RUnlock()
-			time.Sleep(15 * time.Second)
 		}
 	}
 }
@@ -223,17 +221,31 @@ func (p *Process) runHeartbeat() {
 // If the process is stopped before receiving a response, it returns an error with the message "process stopped".
 // If the command times out after 3 seconds, it returns an error with the message "command timeout".
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
+	if _, ok := cmd["id"]; !ok {
+		cmd["id"] = uuid.New().String()
+	}
+	if _, ok := cmd["type"]; !ok {
+		cmd["type"] = "main"
+	}
+
+	ch := make(chan bool, 1)
+	p.waitResponse.Store(cmd["id"].(string), ch)
+
 	p.inputQueue <- cmd
-	for {
-		select {
-		case <-p.ctx.Done():
-			return nil, errors.New("process stopped")
-		case resp := <-p.outputQueue:
-			if resp["id"] == cmd["id"] {
-				return resp, nil
-			}
-		case <-time.After(3 * time.Second):
-			return nil, errors.New("command timeout")
+	start := time.Now().UnixMilli()
+
+	select {
+	case <-p.ctx.Done():
+		return nil, errors.New("process stopped")
+	case resp := <-p.outputQueue:
+		if resp["id"] == cmd["id"] {
+			p.mutex.Lock()
+			p.latency = time.Now().UnixMilli() - start
+			p.mutex.Unlock()
+			return resp, nil
 		}
+		return nil, errors.New("invalid response")
+	case <-time.After(time.Duration(p.timeout) * time.Second):
+		return nil, errors.New("command timeout")
 	}
 }
