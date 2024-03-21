@@ -83,11 +83,11 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 // The ProcessExport object contains information such as the process's readiness, last heartbeat, latency, input queue length, output queue length, and name.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
 	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
 	var exports []ProcessExport
 	for _, process := range pool.processes {
 
 		if process != nil {
+			process.mutex.RLock()
 			exports = append(exports, ProcessExport{
 				IsReady:       process.isReady,
 				LastHeartbeat: process.lastHeartbeat.UnixMilli(),
@@ -96,8 +96,10 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 				OutputQueue:   len(process.outputQueue),
 				Name:          process.name,
 			})
+			process.mutex.RUnlock()
 		}
 	}
+	pool.mutex.Unlock()
 	return exports
 }
 
@@ -149,8 +151,8 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 // StopAll stops all the processes in the process pool.
 func (pool *ProcessPool) StopAll() {
 	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
 	for _, process := range pool.processes {
 		process.Stop()
 	}
+	pool.mutex.Unlock()
 }

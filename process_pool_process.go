@@ -194,25 +194,25 @@ func (p *Process) runHeartbeat() {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-time.After(15 * time.Second):
-			p.lastHeartbeat = time.Now()
-			startTime := time.Now().UnixMilli()
-			cmd := map[string]interface{}{"type": "heartbeat", "id": uuid.New().String()}
-			p.inputQueue <- cmd
-
-			select {
-			case <-p.ctx.Done():
-				return
-			case resp := <-p.outputQueue:
-				if resp["id"] == cmd["id"] {
-					p.logger.Debug().Msgf("[minerva|%s] Heartbeat response received", p.name)
-					latency := time.Now().UnixMilli() - startTime
-					p.latency = latency
+		default:
+			p.mutex.RLock()
+			if p.isReady {
+				p.lastHeartbeat = time.Now()
+				startTime := time.Now().UnixMilli()
+				cmd := map[string]interface{}{"type": "heartbeat", "id": uuid.New().String()}
+				_, err := p.SendCommand(cmd)
+				if err != nil {
+					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send heartbeat", p.name)
+					p.Restart()
+				} else {
+					endTime := time.Now().UnixMilli()
+					p.latency = endTime - startTime
+					p.logger.Debug().Msgf("[minerva|%s] Latency: %dms", p.name, p.latency)
 				}
-			case <-time.After(3 * time.Second):
-				p.logger.Error().Msgf("[minerva|%s] Heartbeat timeout", p.name)
-				p.Restart()
+
 			}
+			p.mutex.RUnlock()
+			time.Sleep(15 * time.Second)
 		}
 	}
 }
