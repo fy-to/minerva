@@ -87,7 +87,6 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	for _, process := range pool.processes {
 
 		if process != nil {
-			process.mutex.RLock()
 			exports = append(exports, ProcessExport{
 				IsReady:       process.isReady,
 				LastHeartbeat: process.lastHeartbeat.UnixMilli(),
@@ -96,7 +95,6 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 				OutputQueue:   len(process.outputQueue),
 				Name:          process.name,
 			})
-			process.mutex.RUnlock()
 		}
 	}
 	pool.mutex.Unlock()
@@ -111,15 +109,12 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 	minQueueLength := math.MaxInt32
 	var minQueueProcess *Process
 	for _, process := range pool.processes {
-
-		process.mutex.RLock()
 		if process.isReady {
 			if len(process.inputQueue) < minQueueLength {
 				minQueueLength = len(process.inputQueue)
 				minQueueProcess = process
 			}
 		}
-		process.mutex.RUnlock()
 	}
 	pool.mutex.Unlock()
 	if minQueueProcess != nil {
