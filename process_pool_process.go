@@ -4,11 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
+	"io"
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,7 +23,7 @@ type Process struct {
 	mutex        sync.RWMutex
 	logger       *zerolog.Logger
 	stdin        *json.Encoder
-	stdout       *bufio.Scanner
+	stdout       *bufio.Reader
 	name         string
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -66,16 +65,15 @@ func (p *Process) Start() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.mutex.Lock()
-	p.cmd = _cmd
-	p.stdin = json.NewEncoder(stdin)
-	p.stdout = bufio.NewScanner(stdout)
-	p.inputQueue = make(chan map[string]interface{}, 100)
-	p.outputQueue = make(chan map[string]interface{}, 100)
 	p.ctx = ctx
 	p.cancel = cancel
+	p.cmd = _cmd
+	p.stdin = json.NewEncoder(stdin)
+	p.stdout = bufio.NewReader(stdout)
+	p.inputQueue = make(chan map[string]interface{}, 100)
+	p.outputQueue = make(chan map[string]interface{}, 100)
 	p.wg = sync.WaitGroup{}
 	p.waitResponse = sync.Map{}
-	p.wg.Add(2)
 	p.mutex.Unlock()
 
 	if err := p.cmd.Start(); err != nil {
@@ -84,57 +82,49 @@ func (p *Process) Start() {
 	}
 
 	p.logger.Info().Msgf("[minerva|%s] Process started", p.name)
-
+	p.wg.Add(2)
 	go func() {
 		p.runReader()
 		p.wg.Done()
+		p.logger.Debug().Msgf("[minerva|%s] Reader stopped", p.name)
 	}()
+
 	go func() {
 		p.runWriter()
 		p.wg.Done()
+		p.logger.Debug().Msgf("[minerva|%s] Writer stopped", p.name)
 	}()
+
 }
 
-// Stop stops the process.
-// It sets the process as not ready, acquires the mutex lock, cancels the context,
-// waits for the wait group to complete, closes the input and output queues,
-// sends a SIGINT signal to the process, and if it doesn't stop within 1 second,
-// kills the process. Finally, it sets the cmd, stdin, and stdout to nil.
-// It logs a message indicating that the process has stopped.
 func (p *Process) Stop() {
-
+	// Signal the context to cancel any ongoing operations
 	p.SetReady(0)
 	p.mutex.Lock()
 	p.cancel()
 	p.mutex.Unlock()
 	p.wg.Wait()
+	p.cmd.Process.Kill()
+	p.cleanupChannelsAndResources()
+	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
+}
+func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Lock()
 	close(p.inputQueue)
 	close(p.outputQueue)
-	p.mutex.Unlock()
-	if p.cmd.Process != nil {
-		p.cmd.Process.Signal(syscall.SIGINT)
-		select {
-		case <-time.After(1 * time.Second):
-			if p.cmd.Process != nil {
-				p.cmd.Process.Kill()
-			}
-		case <-p.ctx.Done():
-			// Process stopped
-		}
-	}
-	p.cmd.Process.Release()
-
-	p.mutex.Lock()
+	p.cmd = nil
 	p.stdin = nil
 	p.stdout = nil
-	p.cmd = nil
+	p.ctx = nil
+	p.cancel = nil
+	p.wg = sync.WaitGroup{}
+	p.waitResponse = sync.Map{}
 	p.mutex.Unlock()
-	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
 }
 
 // Restart restarts the process by stopping it and then starting it again.
 func (p *Process) Restart() {
+	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
 	p.Stop()
 	p.Start()
 }
@@ -153,42 +143,55 @@ func (p *Process) runWriter() {
 		select {
 		case <-p.ctx.Done():
 			// Process stopped
+
 			return
 		case cmd := <-p.inputQueue:
 			// Send command
 			if err := p.stdin.Encode(cmd); err != nil {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
-				p.Restart()
 				continue
 			}
 			id := cmd["id"].(string)
 			ch, _ := p.waitResponse.Load(id)
-			<-ch.(chan bool)
-			p.waitResponse.Delete(id)
+			select {
+			case <-ch.(chan bool):
+				p.waitResponse.Delete(id)
+			case <-time.After(time.Duration(p.timeout) * time.Second):
+				p.logger.Error().Msgf("[minerva|%s] Command timed out", p.name)
+				p.outputQueue <- map[string]interface{}{"id": id, "type": "error", "message": "command timeout"}
+				p.waitResponse.Delete(id)
+			}
+
 		}
 	}
 }
 
-// runReader is a method of the Process struct that reads the output from the process's stdout.
-// It continuously scans the stdout for lines of text, parses them as JSON messages, and handles them accordingly.
-// If a "ready" message is received, it sets the process as ready.
-// If a "success" or "error" message is received, it sends the message to the outputQueue channel.
-// The method stops running when the process is stopped or when there is no more output to read.
 func (p *Process) runReader() {
-	const maxBufferSize = 45 * 1024 * 1024
-	buf := make([]byte, 4096)
-	p.stdout.Buffer(buf, maxBufferSize)
-
+	outputChan := make(chan string)
+	go func() {
+		defer close(outputChan)
+		for {
+			line, err := p.stdout.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
+				}
+				return
+			} else {
+				outputChan <- line
+			}
+		}
+	}()
 	for {
 		select {
 		case <-p.ctx.Done():
-			// Process stopped
+			p.logger.Debug().Msgf("[minerva|%s] Context done", p.name)
 			return
-		default:
-			if !p.stdout.Scan() {
+		case line, ok := <-outputChan:
+			if !ok {
+				p.logger.Debug().Msgf("[minerva|%s] Output channel closed", p.name)
 				return
 			}
-			line := p.stdout.Text()
 			if line == "" {
 				continue
 			}
@@ -202,6 +205,7 @@ func (p *Process) runReader() {
 			if msg["type"] == "ready" {
 				p.logger.Info().Msgf("[minerva|%s] Process is ready", p.name)
 				p.SetReady(1)
+				continue
 			}
 
 			if msg["type"] == "success" || msg["type"] == "error" {
@@ -216,10 +220,6 @@ func (p *Process) runReader() {
 }
 
 // SendCommand sends a command to the process and waits for a response.
-// It takes a map of command parameters as input and returns the response as a map,
-// along with an error if any.
-// If the process is stopped before receiving a response, it returns an error with the message "process stopped".
-// If the command times out after 3 seconds, it returns an error with the message "command timeout".
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
 	if _, ok := cmd["id"]; !ok {
 		cmd["id"] = uuid.New().String()
@@ -236,16 +236,19 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	select {
 	case <-p.ctx.Done():
-		return nil, errors.New("process stopped")
+		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "process stopped"}, nil
 	case resp := <-p.outputQueue:
 		if resp["id"] == cmd["id"] {
 			p.mutex.Lock()
 			p.latency = time.Now().UnixMilli() - start
 			p.mutex.Unlock()
+
+			if resp["type"] == "error" && resp["message"] == "command timeout" {
+				p.Restart()
+			}
+
 			return resp, nil
 		}
-		return nil, errors.New("invalid response")
-	case <-time.After(time.Duration(p.timeout) * time.Second):
-		return nil, errors.New("command timeout")
+		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "invalid response"}, nil
 	}
 }

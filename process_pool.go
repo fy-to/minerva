@@ -1,8 +1,8 @@
 package minerva
 
 import (
+	"container/heap"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 
@@ -85,29 +85,26 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 // It selects the worker with the minimum length of the input queue.
 // If there are no available workers, it returns an error.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
-	var minQueueLength = math.MaxInt32
-	var minQueueProcess *Process
-
 	pool.mutex.RLock()
+	defer pool.mutex.RUnlock()
+
+	var workerQueue ProcessPQ
+
+	// Build the priority queue with available processes
 	for _, process := range pool.processes {
 		if atomic.LoadInt32(&process.isReady) == 1 {
-			process.mutex.RLock()
-			queueLength := len(process.inputQueue)
-			process.mutex.RUnlock()
-
-			if queueLength < minQueueLength {
-				minQueueLength = queueLength
-				minQueueProcess = process
-			}
+			workerQueue = append(workerQueue, process)
 		}
 	}
-	pool.mutex.RUnlock()
 
-	if minQueueProcess == nil {
+	heap.Init(&workerQueue) // Initialize the heap
+
+	if workerQueue.Len() == 0 {
 		return nil, fmt.Errorf("no available workers")
 	}
 
-	return minQueueProcess, nil
+	// Get the process with the shortest queue (highest priority)
+	return workerQueue[0], nil
 }
 
 // SendCommand sends a command to a worker in the process pool.
@@ -128,4 +125,41 @@ func (pool *ProcessPool) StopAll() {
 	for _, process := range pool.processes {
 		process.Stop()
 	}
+}
+
+type ProcessPQ []*Process
+
+func (pq ProcessPQ) Len() int { return len(pq) }
+
+func (pq ProcessPQ) Less(i, j int) bool {
+	pq[i].mutex.Lock()
+	defer pq[i].mutex.Unlock()
+	pq[j].mutex.Lock()
+	defer pq[j].mutex.Unlock()
+
+	// Prioritize processes with shorter input queue length
+	queueLenI := len(pq[i].inputQueue)
+	queueLenJ := len(pq[j].inputQueue)
+	if queueLenI < queueLenJ {
+		return true
+	} else if queueLenI > queueLenJ {
+		return false
+	}
+
+	// If queue lengths are equal, use process.Latency (lower latency wins)
+	return pq[i].latency < pq[j].latency
+}
+
+func (pq ProcessPQ) Swap(i, j int) { pq[i], pq[j] = pq[j], pq[i] }
+
+func (pq *ProcessPQ) Push(x interface{}) {
+	*pq = append(*pq, x.(*Process))
+}
+
+func (pq *ProcessPQ) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	x := old[n-1]
+	*pq = old[0 : n-1]
+	return x
 }
