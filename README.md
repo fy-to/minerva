@@ -1,63 +1,18 @@
-# Used to run FWS Vite SSR (https://fy.to)
-
+# Tools for FWS 
+## ProcessPool (minerva.NewProcessPool)
 For example:
 ```go
-package fwsc
-
-import (
-    "path/filepath"
-
-    "github.com/fy-to/athena/helpers"
-    "github.com/fy-to/athena/services/realm"
-    "github.com/fy-to/minerva"
-)
-
-var MinervaManager minerva.JSManager
-
-func InitMinervaManager() {
-    MinervaManager = *minerva.NewNodeManager(helpers.Logger)
+// Setup
+args := []string{
+    "--experimental-default-type=module",
+    websiteData.Env + "/fws_ssr.js",
 }
+JSManager[website.UUID] = minerva.NewProcessPool(website.Domain, 2, website.SSRInstances, &helpers.Logger, "node", args)
 
-func SetupFunction(args []interface{}) (string, error) {
-    website := args[0].(*realm.Website)
-    websiteData := args[1].(*WebsiteData)
-    content, err := helpers.GetTemplateResult("ssr", &map[string]interface{}{
-        "Req": websiteData.Config.SSRBundlePath,
-        "Domain": website.Domain
-    })
-    if err != nil {
-        helpers.Logger.Error().Err(err).Msg("Error getting SSR template")
-        return "", err
-    }
-
-    return content, nil
-}
-
-func ResetAllNodesForWebsite(websiteUUID string) {
-    for _, process := range MinervaManager.Nodes[websiteUUID] {
-        process.Stop()
-        // delete or something
-    }
-
-    websiteData, website := WebsiteMemory.Get(websiteUUID)
-    if websiteData == nil || website == nil {
-        return
-    }
-    args := []interface{}{website, websiteData}
-
-    for i := 0; i < website.SSRInstances; i++ {
-        MinervaManager.StartProcess(
-            i,
-            website.UUID,
-            filepath.Join(websiteData.Env, "fws_ssr.js"),
-            "node",
-            "\n", 3,
-            true,
-            SetupFunction,
-            &args
-        )
-    }
-}
+//...
+result, err := fwsc.JSManager[c.Website.UUID].SendCommand(map[string]interface{}{
+    "input": fwDataJson,
+})
 ```
 Running a generated fws_ssr.js for example
 ```js
@@ -69,24 +24,36 @@ const rl = readline.createInterface({
     output: process.stdout,
     terminal: false,
 });
-rl.on('line', async (fwData) => {
+
+rl.on('line', async (cmdData) => {
+    let cmd = null;
     try {
-        global.FW = JSON.parse(fwData);
+        cmd = JSON.parse(cmdData);
     } catch (error) {
-        process.stdout.write(JSON.stringify({ success: false, error: "Input error: "+error.message, data: null }) + SEPARATOR);
+        process.stdout.write(JSON.stringify({ type: "error", "output": "Invalid JSON", id: cmd.id }) + SEPARATOR);
         return;
     }
 
-    try {
-        const cb = (result) => {
-            process.stdout.write(JSON.stringify({ success: true, data: result, error: null }) + SEPARATOR);
-        }
-        await render(cb);
-        return;
-    } catch (error) {
-        process.stdout.write(JSON.stringify({ success: false, error: "SSR error: "+error.message, data: null }) + SEPARATOR);
+    if (cmd.type === "heartbeat") {
+        process.stdout.write(JSON.stringify({ type: "success", "id": cmd.id }) + SEPARATOR);
         return;
     }
+    
+    if (cmd.type === "main") {
+        global.FW = cmd.input
+
+        try {
+            const cb = (result) => {
+                process.stdout.write(JSON.stringify({ type: "success", "output": result, id: cmd.id }) + SEPARATOR);
+            }
+            await render(cb);
+            return;
+        } catch (error) {
+            process.stdout.write(JSON.stringify({ type: "error", "output": error.message, id: cmd.id }) + SEPARATOR);
+            return;
+        
+        }
+    }
 });
-```
+process.stdout.write(JSON.stringify({ type: "ready" }) + SEPARATOR);
 
