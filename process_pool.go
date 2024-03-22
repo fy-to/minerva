@@ -17,7 +17,7 @@ type ProcessPool struct {
 }
 
 // NewProcessPool creates a new process pool.
-func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cmd string, cmdArgs []string) *ProcessPool {
+func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cwd string, cmd string, cmdArgs []string) *ProcessPool {
 	pool := &ProcessPool{
 		processes: make([]*Process, size),
 		logger:    logger,
@@ -25,13 +25,13 @@ func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, 
 	}
 	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
-		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout)
+		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout, cwd)
 	}
 	return pool
 }
 
 // newProcess creates a new process in the process pool.
-func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, timeout int) {
+func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, timeout int, cwd string) {
 
 	pool.mutex.Lock()
 
@@ -46,6 +46,7 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		requestsHandled: 0,
 		restarts:        0,
 		id:              i,
+		cwd:             cwd,
 	}
 	pool.mutex.Unlock()
 	pool.processes[i].Start()

@@ -35,6 +35,7 @@ type Process struct {
 	requestsHandled int
 	restarts        int
 	id              int
+	cwd             string
 }
 
 type ProcessExport struct {
@@ -74,7 +75,7 @@ func (p *Process) Start() {
 	p.wg = sync.WaitGroup{}
 	p.waitResponse = sync.Map{}
 	p.mutex.Unlock()
-
+	p.cmd.Dir = p.cwd
 	if err := p.cmd.Start(); err != nil {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to start process", p.name)
 		return
@@ -154,6 +155,8 @@ func (p *Process) runWriter() {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
 				continue
 			}
+			jsonCmd, _ := json.Marshal(cmd)
+			p.logger.Debug().Msgf("[minerva|%s] Command sent: %v", p.name, string(jsonCmd))
 			id := cmd["id"].(string)
 			ch, _ := p.waitResponse.Load(id)
 			select {
@@ -196,13 +199,12 @@ func (p *Process) runReader() {
 				p.logger.Debug().Msgf("[minerva|%s] Output channel closed", p.name)
 				return
 			}
-			if line == "" {
+			if line == "" || line == "\n" {
 				continue
 			}
-
 			var msg map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to parse message", p.name)
+				p.logger.Warn().Msgf("[minerva|%s] Non JSON message received: '%s'", p.name, line)
 				continue
 			}
 
@@ -254,6 +256,6 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 			return resp, nil
 		}
-		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "invalid response"}, nil
 	}
+	return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "unknown error"}, nil
 }
