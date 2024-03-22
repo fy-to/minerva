@@ -13,6 +13,7 @@ type ProcessPool struct {
 	processes []*Process
 	mutex     sync.RWMutex
 	logger    *zerolog.Logger
+	queue     ProcessPQ
 }
 
 // NewProcessPool creates a new process pool with the specified name, size, logger, command, and command arguments.
@@ -22,6 +23,7 @@ func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, 
 		processes: make([]*Process, size),
 		logger:    logger,
 		mutex:     sync.RWMutex{},
+		queue:     ProcessPQ{},
 	}
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout)
@@ -44,13 +46,15 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 	pool.mutex.Lock()
 
 	pool.processes[i] = &Process{
-		isReady: 0,
-		latency: 0,
-		logger:  logger,
-		name:    fmt.Sprintf("%s#%d", name, i),
-		cmdStr:  cmd,
-		cmdArgs: cmdArgs,
-		timeout: timeout,
+		isReady:         0,
+		latency:         0,
+		logger:          logger,
+		name:            fmt.Sprintf("%s#%d", name, i),
+		cmdStr:          cmd,
+		cmdArgs:         cmdArgs,
+		timeout:         timeout,
+		requestsHandled: 0,
+		restarts:        0,
 	}
 	pool.mutex.Unlock()
 	pool.processes[i].Start()
@@ -88,23 +92,14 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 	pool.mutex.RLock()
 	defer pool.mutex.RUnlock()
 
-	var workerQueue ProcessPQ
+	pool.queue.Update(pool)
 
-	// Build the priority queue with available processes
-	for _, process := range pool.processes {
-		if atomic.LoadInt32(&process.isReady) == 1 {
-			workerQueue = append(workerQueue, process)
-		}
-	}
-
-	heap.Init(&workerQueue) // Initialize the heap
-
-	if workerQueue.Len() == 0 {
+	if pool.queue.Len() == 0 {
 		return nil, fmt.Errorf("no available workers")
 	}
 
-	// Get the process with the shortest queue (highest priority)
-	return workerQueue[0], nil
+	processWithPrio := pool.queue.Pop().(*ProcessWithPrio)
+	return processWithPrio.process, nil
 }
 
 // SendCommand sends a command to a worker in the process pool.
@@ -127,39 +122,69 @@ func (pool *ProcessPool) StopAll() {
 	}
 }
 
-type ProcessPQ []*Process
+type ProcessPQ struct {
+	processes []*Process
+	mutex     sync.Mutex
+}
 
-func (pq ProcessPQ) Len() int { return len(pq) }
+func (pq *ProcessPQ) Len() int { return len(pq.processes) }
 
-func (pq ProcessPQ) Less(i, j int) bool {
-	pq[i].mutex.Lock()
-	defer pq[i].mutex.Unlock()
-	pq[j].mutex.Lock()
-	defer pq[j].mutex.Unlock()
+func (pq *ProcessPQ) Less(i, j int) bool {
+	pq.processes[i].mutex.RLock()
+	defer pq.processes[i].mutex.RUnlock()
+	pq.processes[j].mutex.RLock()
+	defer pq.processes[j].mutex.RUnlock()
 
-	// Prioritize processes with shorter input queue length
-	queueLenI := len(pq[i].inputQueue)
-	queueLenJ := len(pq[j].inputQueue)
-	if queueLenI < queueLenJ {
-		return true
-	} else if queueLenI > queueLenJ {
-		return false
+	queueLenI := len(pq.processes[i].inputQueue)
+	queueLenJ := len(pq.processes[j].inputQueue)
+	if queueLenI != queueLenJ {
+		return queueLenI < queueLenJ
 	}
 
-	// If queue lengths are equal, use process.Latency (lower latency wins)
-	return pq[i].latency < pq[j].latency
+	return pq.processes[i].latency < pq.processes[j].latency
 }
 
-func (pq ProcessPQ) Swap(i, j int) { pq[i], pq[j] = pq[j], pq[i] }
+func (pq *ProcessPQ) Swap(i, j int) {
+	pq.processes[i], pq.processes[j] = pq.processes[j], pq.processes[i]
+}
 
 func (pq *ProcessPQ) Push(x interface{}) {
-	*pq = append(*pq, x.(*Process))
-}
+	pq.mutex.Lock()
+	defer pq.mutex.Unlock()
 
+	pq.processes = append(pq.processes, x.(*Process))
+}
 func (pq *ProcessPQ) Pop() interface{} {
-	old := *pq
+	pq.mutex.Lock()
+	defer pq.mutex.Unlock()
+
+	old := pq.processes
 	n := len(old)
 	x := old[n-1]
-	*pq = old[0 : n-1]
+	pq.processes = old[0 : n-1]
 	return x
+}
+
+func (pq *ProcessPQ) Update(pool *ProcessPool) {
+	pq.mutex.Lock()
+	defer pq.mutex.Unlock()
+
+	pq.processes = pq.processes[:0]
+
+	for _, process := range pool.processes {
+		if atomic.LoadInt32(&process.isReady) == 1 {
+			process.mutex.RLock()
+			queueLength := len(process.inputQueue)
+			latency := process.latency
+			process.mutex.RUnlock()
+			heap.Push(pq, &ProcessWithPrio{process, queueLength, latency})
+		}
+	}
+	heap.Init(pq) // Re-initialize the heap after updates
+}
+
+type ProcessWithPrio struct {
+	process     *Process
+	queueLength int
+	latency     int64 // Assuming latency is an int64
 }

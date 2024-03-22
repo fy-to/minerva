@@ -15,31 +15,35 @@ import (
 )
 
 type Process struct {
-	cmd          *exec.Cmd
-	inputQueue   chan map[string]interface{}
-	outputQueue  chan map[string]interface{}
-	isReady      int32
-	latency      int64
-	mutex        sync.RWMutex
-	logger       *zerolog.Logger
-	stdin        *json.Encoder
-	stdout       *bufio.Reader
-	name         string
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	cmdStr       string
-	cmdArgs      []string
-	timeout      int
-	waitResponse sync.Map
+	cmd             *exec.Cmd
+	inputQueue      chan map[string]interface{}
+	outputQueue     chan map[string]interface{}
+	isReady         int32
+	latency         int64
+	mutex           sync.RWMutex
+	logger          *zerolog.Logger
+	stdin           *json.Encoder
+	stdout          *bufio.Reader
+	name            string
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	cmdStr          string
+	cmdArgs         []string
+	timeout         int
+	waitResponse    sync.Map
+	requestsHandled int
+	restarts        int
 }
 
 type ProcessExport struct {
-	IsReady     bool  `json:"isReady"`
-	Latency     int64 `json:"latency"`
-	InputQueue  int   `json:"inputQueue"`
-	OutputQueue int   `json:"outputQueue"`
-	Name        string
+	IsReady         bool   `json:"IsReady"`
+	Latency         int64  `json:"Latency"`
+	InputQueue      int    `json:"InputQueue"`
+	OutputQueue     int    `json:"OutputQueue"`
+	Name            string `json:"Name"`
+	Restarts        int    `json:"Restarts"`
+	RequestsHandled int    `json:"RequestsHandled"`
 }
 
 // Start starts the process.
@@ -108,6 +112,7 @@ func (p *Process) Stop() {
 	p.cleanupChannelsAndResources()
 	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
 }
+
 func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Lock()
 	close(p.inputQueue)
@@ -125,6 +130,9 @@ func (p *Process) cleanupChannelsAndResources() {
 // Restart restarts the process by stopping it and then starting it again.
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
+	p.mutex.Lock()
+	p.restarts++
+	p.mutex.Unlock()
 	p.Stop()
 	p.Start()
 }
@@ -241,6 +249,7 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		if resp["id"] == cmd["id"] {
 			p.mutex.Lock()
 			p.latency = time.Now().UnixMilli() - start
+			p.requestsHandled++
 			p.mutex.Unlock()
 
 			if resp["type"] == "error" && resp["message"] == "command timeout" {
