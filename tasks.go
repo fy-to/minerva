@@ -14,27 +14,20 @@ type ITask interface {
 	MarkAsFailed(error)
 	Save() error
 	Priority() int
-	Options() map[string]interface{}
 	MaxRetries() int
 	Retries() int
-	LastError() string
-	Failed() bool
 	CreatedAt() time.Time
-	CompletedAt() time.Time
-	UUID() string
 	TaskGroup() ITaskGroup
 	Provider() IProvider
 	UpdateRetries(int) error
+	UpdateLastError(string) error
 }
 
 type ITaskGroup interface {
-	AddTask(task ITask) error
 	MarkComplete() error
-	Save() error
-	CompletedAt() time.Time
 	TaskCount() int
 	TaskCompletedCount() int
-	Command() string
+	UpdateTaskCompletedCount(int) error
 }
 
 type IProvider interface {
@@ -144,14 +137,28 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 		if err != nil {
 			m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task %d/%d", provider, server, taskPriority.task.Priority(), taskPriority.task.Retries())
 			taskPriority.task.UpdateRetries(taskPriority.task.Retries() + 1)
-
+			taskPriority.task.UpdateLastError(err.Error())
 			if taskPriority.task.Retries() < taskPriority.task.MaxRetries() {
 				m.AddTask(taskPriority.task)
 			} else {
 				taskPriority.task.MarkAsFailed(err)
+				if taskPriority.task.TaskGroup() != nil {
+					taskGroup := taskPriority.task.TaskGroup()
+					taskGroup.UpdateTaskCompletedCount(taskGroup.TaskCompletedCount() + 1)
+					if taskGroup.TaskCount() == taskGroup.TaskCompletedCount() {
+						taskGroup.MarkComplete()
+					}
+				}
 			}
 		} else {
 			taskPriority.task.MarkAsSuccess()
+			if taskPriority.task.TaskGroup() != nil {
+				taskGroup := taskPriority.task.TaskGroup()
+				taskGroup.UpdateTaskCompletedCount(taskGroup.TaskCompletedCount() + 1)
+				if taskGroup.TaskCount() == taskGroup.TaskCompletedCount() {
+					taskGroup.MarkComplete()
+				}
+			}
 		}
 		m.cond[provider].L.Lock()
 	}
