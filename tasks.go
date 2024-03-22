@@ -12,21 +12,22 @@ import (
 type ITask interface {
 	MarkAsSuccess()
 	MarkAsFailed(error)
-	Save() error
-	Priority() int
-	MaxRetries() int
-	Retries() int
-	CreatedAt() time.Time
-	TaskGroup() ITaskGroup
-	Provider() IProvider
+	GetPriority() int
+	GetMaxRetries() int
+	GetRetries() int
+	GetCreatedAt() time.Time
+	GetTaskGroup() ITaskGroup
+	GetProvider() IProvider
 	UpdateRetries(int) error
 	UpdateLastError(string) error
+	OnComplete()
+	OnStart()
 }
 
 type ITaskGroup interface {
 	MarkComplete() error
-	TaskCount() int
-	TaskCompletedCount() int
+	GetTaskCount() int
+	GetTaskCompletedCount() int
 	UpdateTaskCompletedCount(int) error
 }
 
@@ -46,36 +47,43 @@ type TaskQueueManager struct {
 	wg         sync.WaitGroup
 }
 
-func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider) *TaskQueueManager {
-	return &TaskQueueManager{
+func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string) *TaskQueueManager {
+	tm := &TaskQueueManager{
 		queues:     make(map[string]map[string]*PriorityQueue),
 		lock:       make(map[string]*sync.Mutex),
 		cond:       make(map[string]*sync.Cond),
-		providers:  providers,
-		logger:     logger,
 		queueSizes: make(map[string]map[string]int),
+		logger:     logger,
+		providers:  providers,
 		shutdownCh: make(chan struct{}),
-		wg:         sync.WaitGroup{},
 	}
+
+	for _, provider := range *providers {
+		tm.queues[provider.Name()] = make(map[string]*PriorityQueue)
+		tm.queueSizes[provider.Name()] = make(map[string]int)
+		for _, server := range servers[provider.Name()] {
+			pq := make(PriorityQueue, 0)
+			heap.Init(&pq)
+			tm.queues[provider.Name()][server] = &pq
+			tm.queueSizes[provider.Name()][server] = 0
+			mutex := &sync.Mutex{}
+			tm.lock[provider.Name()] = mutex
+			tm.cond[provider.Name()] = sync.NewCond(mutex)
+		}
+	}
+
+	return tm
 }
 
 func (m *TaskQueueManager) Start(tasks []ITask) {
-	for _, provider := range *m.providers {
-		providerName := provider.Name()
-		m.lock[providerName] = &sync.Mutex{}
-		m.cond[providerName] = sync.NewCond(m.lock[providerName])
-		m.queueSizes[providerName] = make(map[string]int)
-		m.queues[providerName] = make(map[string]*PriorityQueue)
-	}
-
 	for _, task := range tasks {
 		m.AddTask(task)
 	}
 
-	for provider, servers := range m.queues {
-		for server := range servers {
-			m.logger.Debug().Msgf("[minerva|%s|%s] Starting queue processor", provider, server)
-			go m.processQueue(provider, server)
+	for _, provider := range *m.providers {
+		for server := range m.queues[provider.Name()] {
+			m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", provider.Name(), server)
+			go m.processQueue(provider.Name(), server)
 		}
 	}
 }
@@ -96,7 +104,7 @@ func (m *TaskQueueManager) selectServerWithLowestQueue(provider string) string {
 	return lowestServer
 }
 func (m *TaskQueueManager) AddTask(task ITask) {
-	provider := task.Provider().Name()
+	provider := task.GetProvider().Name()
 	server := m.selectServerWithLowestQueue(provider)
 	m.lock[provider].Lock()
 	defer m.lock[provider].Unlock()
@@ -106,10 +114,11 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 
 	heap.Push(m.queues[provider][server], &TaskPriority{
 		task:     task,
-		priority: task.Priority(),
+		priority: task.GetPriority(),
 	})
-	m.logger.Debug().Msgf("[minerva|%s|%s] Added task %d/%d", provider, server, task.Priority(), task.Retries())
+	m.logger.Info().Msgf("[minerva|%s|%s] Added task with priority %d to queue (%d/%d)", provider, server, task.GetPriority(), task.GetRetries(), task.GetMaxRetries())
 	m.queueSizes[provider][server]++
+	task.OnStart()
 	m.cond[provider].Signal()
 }
 
@@ -130,32 +139,34 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 		}
 		taskPriority := heap.Pop(m.queues[provider][server]).(*TaskPriority)
 		m.queueSizes[provider][server]--
+
 		m.cond[provider].L.Unlock()
 
-		var err error
-		err = taskPriority.task.Provider().Handle(taskPriority.task, server)
+		err := taskPriority.task.GetProvider().Handle(taskPriority.task, server)
 		if err != nil {
-			m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task %d/%d", provider, server, taskPriority.task.Priority(), taskPriority.task.Retries())
-			taskPriority.task.UpdateRetries(taskPriority.task.Retries() + 1)
+			m.logger.Warn().Msgf("[minerva|%s|%s] Failed to handle task %d/%d: %s", provider, server, taskPriority.task.GetRetries(), taskPriority.task.GetMaxRetries(), err.Error())
+			taskPriority.task.UpdateRetries(taskPriority.task.GetRetries() + 1)
 			taskPriority.task.UpdateLastError(err.Error())
-			if taskPriority.task.Retries() < taskPriority.task.MaxRetries() {
+			if taskPriority.task.GetRetries() <= taskPriority.task.GetMaxRetries() {
 				m.AddTask(taskPriority.task)
 			} else {
 				taskPriority.task.MarkAsFailed(err)
-				if taskPriority.task.TaskGroup() != nil {
-					taskGroup := taskPriority.task.TaskGroup()
-					taskGroup.UpdateTaskCompletedCount(taskGroup.TaskCompletedCount() + 1)
-					if taskGroup.TaskCount() == taskGroup.TaskCompletedCount() {
+				taskPriority.task.OnComplete()
+				if taskPriority.task.GetTaskGroup() != nil {
+					taskGroup := taskPriority.task.GetTaskGroup()
+					taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+					if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
 						taskGroup.MarkComplete()
 					}
 				}
 			}
 		} else {
 			taskPriority.task.MarkAsSuccess()
-			if taskPriority.task.TaskGroup() != nil {
-				taskGroup := taskPriority.task.TaskGroup()
-				taskGroup.UpdateTaskCompletedCount(taskGroup.TaskCompletedCount() + 1)
-				if taskGroup.TaskCount() == taskGroup.TaskCompletedCount() {
+			taskPriority.task.OnComplete()
+			if taskPriority.task.GetTaskGroup() != nil {
+				taskGroup := taskPriority.task.GetTaskGroup()
+				taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+				if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
 					taskGroup.MarkComplete()
 				}
 			}

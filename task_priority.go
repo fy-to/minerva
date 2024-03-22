@@ -32,7 +32,7 @@ func (pq *PriorityQueue) Pop() interface{} {
 }
 func (pq PriorityQueue) Less(i, j int) bool {
 	if pq[i].priority == pq[j].priority {
-		return pq[i].task.CreatedAt().Before(pq[j].task.CreatedAt())
+		return pq[i].task.GetCreatedAt().Before(pq[j].task.GetCreatedAt())
 	}
 	return pq[i].priority < pq[j].priority
 }

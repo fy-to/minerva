@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -87,6 +88,29 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 
 	processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
 	return pool.processes[processWithPrio.processId], nil
+}
+
+// Should wait for X seconds until at least one worker is ready
+func (pool *ProcessPool) WaitForReady(maxTime time.Duration) error {
+	start := time.Now()
+	for {
+		pool.mutex.RLock()
+		ready := true
+		for _, process := range pool.processes {
+			if atomic.LoadInt32(&process.isReady) == 0 {
+				ready = false
+				break
+			}
+		}
+		pool.mutex.RUnlock()
+		if ready {
+			return nil
+		}
+		if time.Since(start) > maxTime {
+			return fmt.Errorf("timeout waiting for workers to be ready")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // SendCommand sends a command to a worker in the process pool.
