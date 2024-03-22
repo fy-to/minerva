@@ -23,8 +23,8 @@ func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, 
 		processes: make([]*Process, size),
 		logger:    logger,
 		mutex:     sync.RWMutex{},
-		queue:     ProcessPQ{},
 	}
+	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout)
 	}
@@ -55,6 +55,7 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		timeout:         timeout,
 		requestsHandled: 0,
 		restarts:        0,
+		id:              i,
 	}
 	pool.mutex.Unlock()
 	pool.processes[i].Start()
@@ -72,11 +73,13 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 		if process != nil {
 			process.mutex.Lock()
 			exports = append(exports, ProcessExport{
-				IsReady:     atomic.LoadInt32(&process.isReady) == 1,
-				Latency:     process.latency,
-				InputQueue:  len(process.inputQueue),
-				OutputQueue: len(process.outputQueue),
-				Name:        process.name,
+				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
+				Latency:         process.latency,
+				InputQueue:      len(process.inputQueue),
+				OutputQueue:     len(process.outputQueue),
+				Name:            process.name,
+				Restarts:        process.restarts,
+				RequestsHandled: process.requestsHandled,
 			})
 			process.mutex.Unlock()
 		}
@@ -89,17 +92,14 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 // It selects the worker with the minimum length of the input queue.
 // If there are no available workers, it returns an error.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
-	pool.mutex.RLock()
-	defer pool.mutex.RUnlock()
-
-	pool.queue.Update(pool)
+	pool.queue.Update()
 
 	if pool.queue.Len() == 0 {
 		return nil, fmt.Errorf("no available workers")
 	}
 
-	processWithPrio := pool.queue.Pop().(*ProcessWithPrio)
-	return processWithPrio.process, nil
+	processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
+	return pool.processes[processWithPrio.processId], nil
 }
 
 // SendCommand sends a command to a worker in the process pool.
@@ -122,26 +122,31 @@ func (pool *ProcessPool) StopAll() {
 	}
 }
 
-type ProcessPQ struct {
-	processes []*Process
-	mutex     sync.Mutex
+type ProcessWithPrio struct {
+	processId   int
+	queueLength int
+	handled     int
 }
 
-func (pq *ProcessPQ) Len() int { return len(pq.processes) }
+// ProcessPQ implements a priority queue for processes.
+type ProcessPQ struct {
+	processes []*ProcessWithPrio
+	mutex     sync.Mutex
+	pool      *ProcessPool
+}
+
+// Implementing the heap.Interface for ProcessPQ.
+func (pq *ProcessPQ) Len() int {
+	return len(pq.processes)
+}
 
 func (pq *ProcessPQ) Less(i, j int) bool {
-	pq.processes[i].mutex.RLock()
-	defer pq.processes[i].mutex.RUnlock()
-	pq.processes[j].mutex.RLock()
-	defer pq.processes[j].mutex.RUnlock()
-
-	queueLenI := len(pq.processes[i].inputQueue)
-	queueLenJ := len(pq.processes[j].inputQueue)
-	if queueLenI != queueLenJ {
-		return queueLenI < queueLenJ
+	// First, compare based on queue length.
+	if pq.processes[i].queueLength == pq.processes[j].queueLength {
+		// If equal, compare based on the number of handled requests.
+		return pq.processes[i].handled < pq.processes[j].handled
 	}
-
-	return pq.processes[i].latency < pq.processes[j].latency
+	return pq.processes[i].queueLength < pq.processes[j].queueLength
 }
 
 func (pq *ProcessPQ) Swap(i, j int) {
@@ -149,42 +154,39 @@ func (pq *ProcessPQ) Swap(i, j int) {
 }
 
 func (pq *ProcessPQ) Push(x interface{}) {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	pq.processes = append(pq.processes, x.(*Process))
+	item := x.(*ProcessWithPrio)
+	pq.processes = append(pq.processes, item)
 }
-func (pq *ProcessPQ) Pop() interface{} {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
 
+func (pq *ProcessPQ) Pop() interface{} {
 	old := pq.processes
 	n := len(old)
-	x := old[n-1]
-	pq.processes = old[0 : n-1]
-	return x
+	item := old[n-1]
+	pq.processes = old[:n-1]
+	return item
 }
 
-func (pq *ProcessPQ) Update(pool *ProcessPool) {
+// Update rebuilds the priority queue with current process states.
+func (pq *ProcessPQ) Update() {
 	pq.mutex.Lock()
 	defer pq.mutex.Unlock()
 
-	pq.processes = pq.processes[:0]
+	// Clear current queue
+	pq.processes = nil
 
-	for _, process := range pool.processes {
+	pq.pool.mutex.RLock()
+	defer pq.pool.mutex.RUnlock()
+
+	for _, process := range pq.pool.processes {
 		if atomic.LoadInt32(&process.isReady) == 1 {
-			process.mutex.RLock()
-			queueLength := len(process.inputQueue)
-			latency := process.latency
-			process.mutex.RUnlock()
-			heap.Push(pq, &ProcessWithPrio{process, queueLength, latency})
+			pq.Push(&ProcessWithPrio{
+				processId:   process.id,
+				queueLength: len(process.inputQueue),
+				handled:     process.requestsHandled,
+			})
 		}
 	}
-	heap.Init(pq) // Re-initialize the heap after updates
-}
 
-type ProcessWithPrio struct {
-	process     *Process
-	queueLength int
-	latency     int64 // Assuming latency is an int64
+	// Reinitialize the heap to ensure the queue is correctly sorted.
+	heap.Init(pq)
 }

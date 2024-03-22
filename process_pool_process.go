@@ -34,6 +34,7 @@ type Process struct {
 	waitResponse    sync.Map
 	requestsHandled int
 	restarts        int
+	id              int
 }
 
 type ProcessExport struct {
@@ -131,7 +132,7 @@ func (p *Process) cleanupChannelsAndResources() {
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
 	p.mutex.Lock()
-	p.restarts++
+	p.restarts = p.restarts + 1
 	p.mutex.Unlock()
 	p.Stop()
 	p.Start()
@@ -249,7 +250,7 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		if resp["id"] == cmd["id"] {
 			p.mutex.Lock()
 			p.latency = time.Now().UnixMilli() - start
-			p.requestsHandled++
+			p.requestsHandled = p.requestsHandled + 1
 			p.mutex.Unlock()
 
 			if resp["type"] == "error" && resp["message"] == "command timeout" {
