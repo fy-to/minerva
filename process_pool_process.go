@@ -47,13 +47,7 @@ type ProcessExport struct {
 	RequestsHandled int    `json:"RequestsHandled"`
 }
 
-// Start starts the process.
-// If the process is already running, it logs a warning and returns.
-// It sets the process as not ready, creates a new context with cancelation function,
-// and starts the process command.
-// If there is an error starting the process, it logs an error and returns.
-// It logs an info message when the process is successfully started.
-// It spawns three goroutines to run the reader, writer, and heartbeat functions.
+// Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
 func (p *Process) Start() {
 	p.SetReady(0)
 	_cmd := exec.Command(p.cmdStr, p.cmdArgs...)
@@ -102,8 +96,8 @@ func (p *Process) Start() {
 
 }
 
+// Stop stops the process by sending a kill signal to the process and cleaning up the resources.
 func (p *Process) Stop() {
-	// Signal the context to cancel any ongoing operations
 	p.SetReady(0)
 	p.mutex.Lock()
 	p.cancel()
@@ -114,6 +108,7 @@ func (p *Process) Stop() {
 	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
 }
 
+// cleanupChannelsAndResources closes the inputQueue and outputQueue channels and sets the cmd, stdin, stdout, ctx, cancel, and wg to nil.
 func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Lock()
 	close(p.inputQueue)
@@ -128,7 +123,7 @@ func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Unlock()
 }
 
-// Restart restarts the process by stopping it and then starting it again.
+// Restart stops the process and starts it again.
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
 	p.mutex.Lock()
@@ -145,8 +140,7 @@ func (p *Process) SetReady(ready int32) {
 	atomic.StoreInt32(&p.isReady, ready)
 }
 
-// runWriter is a goroutine that continuously reads commands from the inputQueue and sends them to the process's stdin.
-// It runs until the process is stopped or an error occurs while sending a command.
+// IsReady returns true if the process is ready, false otherwise.
 func (p *Process) runWriter() {
 	for {
 		select {
@@ -175,6 +169,7 @@ func (p *Process) runWriter() {
 	}
 }
 
+// runReader reads the stdout of the process and sends the messages to the outputQueue.
 func (p *Process) runReader() {
 	outputChan := make(chan string)
 	go func() {
@@ -228,7 +223,7 @@ func (p *Process) runReader() {
 	}
 }
 
-// SendCommand sends a command to the process and waits for a response.
+// SendCommand sends a command to the process and waits for the response.
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
 	if _, ok := cmd["id"]; !ok {
 		cmd["id"] = uuid.New().String()

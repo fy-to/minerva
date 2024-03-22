@@ -16,8 +16,7 @@ type ProcessPool struct {
 	queue     ProcessPQ
 }
 
-// NewProcessPool creates a new process pool with the specified name, size, logger, command, and command arguments.
-// It initializes the pool with the specified number of processes and returns the created process pool.
+// NewProcessPool creates a new process pool.
 func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cmd string, cmdArgs []string) *ProcessPool {
 	pool := &ProcessPool{
 		processes: make([]*Process, size),
@@ -32,15 +31,6 @@ func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, 
 }
 
 // newProcess creates a new process in the process pool.
-// It takes the following parameters:
-// - name: the name of the process
-// - i: the index of the process in the process pool
-// - cmd: the command to execute
-// - cmdArgs: the arguments for the command
-// - logger: the logger for logging errors and messages
-//
-// It initializes the process with the given parameters, sets up the stdin and stdout pipes,
-// and starts the process.
 func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, timeout int) {
 
 	pool.mutex.Lock()
@@ -63,8 +53,6 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 }
 
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
-// It acquires a lock on the process pool, iterates over each process, and creates a ProcessExport object for each non-nil process.
-// The ProcessExport object contains information such as the process's readiness, last heartbeat, latency, input queue length, output queue length, and name.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
 	pool.mutex.RLock()
 	var exports []ProcessExport
@@ -89,8 +77,6 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 }
 
 // GetWorker returns a worker process from the process pool.
-// It selects the worker with the minimum length of the input queue.
-// If there are no available workers, it returns an error.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
 	pool.queue.Update()
 
@@ -103,8 +89,6 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 }
 
 // SendCommand sends a command to a worker in the process pool.
-// It takes a map of command parameters as input and returns the response from the worker.
-// If an error occurs during the process, it returns nil and the error.
 func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
 	worker, err := pool.GetWorker()
 	if err != nil {
@@ -128,22 +112,18 @@ type ProcessWithPrio struct {
 	handled     int
 }
 
-// ProcessPQ implements a priority queue for processes.
 type ProcessPQ struct {
 	processes []*ProcessWithPrio
 	mutex     sync.Mutex
 	pool      *ProcessPool
 }
 
-// Implementing the heap.Interface for ProcessPQ.
 func (pq *ProcessPQ) Len() int {
 	return len(pq.processes)
 }
 
 func (pq *ProcessPQ) Less(i, j int) bool {
-	// First, compare based on queue length.
 	if pq.processes[i].queueLength == pq.processes[j].queueLength {
-		// If equal, compare based on the number of handled requests.
 		return pq.processes[i].handled < pq.processes[j].handled
 	}
 	return pq.processes[i].queueLength < pq.processes[j].queueLength
@@ -166,12 +146,10 @@ func (pq *ProcessPQ) Pop() interface{} {
 	return item
 }
 
-// Update rebuilds the priority queue with current process states.
 func (pq *ProcessPQ) Update() {
 	pq.mutex.Lock()
 	defer pq.mutex.Unlock()
 
-	// Clear current queue
 	pq.processes = nil
 
 	pq.pool.mutex.RLock()
@@ -187,6 +165,5 @@ func (pq *ProcessPQ) Update() {
 		}
 	}
 
-	// Reinitialize the heap to ensure the queue is correctly sorted.
 	heap.Init(pq)
 }
