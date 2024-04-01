@@ -2,6 +2,8 @@ package minerva
 
 import (
 	"container/heap"
+	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -76,9 +78,6 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 }
 
 func (m *TaskQueueManager) Start(tasks []ITask) {
-	for _, task := range tasks {
-		m.AddTask(task)
-	}
 
 	for _, provider := range *m.providers {
 		for server := range m.queues[provider.Name()] {
@@ -86,6 +85,11 @@ func (m *TaskQueueManager) Start(tasks []ITask) {
 			go m.processQueue(provider.Name(), server)
 		}
 	}
+
+	for _, task := range tasks {
+		m.AddTask(task)
+	}
+
 }
 func (m *TaskQueueManager) selectServerWithLowestQueue(provider string) string {
 	lowestSize := math.MaxInt
@@ -104,8 +108,31 @@ func (m *TaskQueueManager) selectServerWithLowestQueue(provider string) string {
 	return lowestServer
 }
 func (m *TaskQueueManager) AddTask(task ITask) {
-	provider := task.GetProvider().Name()
-	server := m.selectServerWithLowestQueue(provider)
+	panicked := false
+	var provider string
+	var server string
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errMsg := fmt.Sprintf("Recovered from panic: %v", r)
+				m.logger.Error().Msgf("[minerva] recovered from panic: %s", errMsg)
+				panicked = true
+			}
+		}()
+
+		provider = task.GetProvider().Name()
+		server = m.selectServerWithLowestQueue(provider)
+	}()
+
+	if panicked {
+		return
+	}
+	// check if provider is not nil and is in the list of providers by checking m.queues for exemple
+	if _, ok := m.queues[provider]; !ok {
+		m.logger.Error().Msgf("[minerva|%s|%s] Provider not found", provider, server)
+		return
+	}
 	m.lock[provider].Lock()
 	defer m.lock[provider].Unlock()
 	if _, ok := m.queues[provider][server]; !ok {
@@ -118,7 +145,6 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	})
 	m.logger.Info().Msgf("[minerva|%s|%s] Added task with priority %d to queue (%d/%d)", provider, server, task.GetPriority(), task.GetRetries(), task.GetMaxRetries())
 	m.queueSizes[provider][server]++
-	task.OnStart()
 	m.cond[provider].Signal()
 }
 
@@ -138,39 +164,71 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 			}
 		}
 		taskPriority := heap.Pop(m.queues[provider][server]).(*TaskPriority)
+		t := taskPriority.task
 		m.queueSizes[provider][server]--
 
 		m.cond[provider].L.Unlock()
+		hasPanic := false
 
-		err := taskPriority.task.GetProvider().Handle(taskPriority.task, server)
-		if err != nil {
-			m.logger.Warn().Msgf("[minerva|%s|%s] Failed to handle task %d/%d: %s", provider, server, taskPriority.task.GetRetries(), taskPriority.task.GetMaxRetries(), err.Error())
-			taskPriority.task.UpdateRetries(taskPriority.task.GetRetries() + 1)
-			taskPriority.task.UpdateLastError(err.Error())
-			if taskPriority.task.GetRetries() <= taskPriority.task.GetMaxRetries() {
-				m.AddTask(taskPriority.task)
-			} else {
-				taskPriority.task.MarkAsFailed(err)
-				taskPriority.task.OnComplete()
-				if taskPriority.task.GetTaskGroup() != nil {
-					taskGroup := taskPriority.task.GetTaskGroup()
-					taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-					if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-						taskGroup.MarkComplete()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errMsg := fmt.Sprintf("Recovered from panic: %v", r)
+					m.logger.Error().Msgf("[minerva|%s|%s] recovered from panic: %s", provider, server, errMsg)
+
+					t.UpdateLastError(errMsg)
+					t.MarkAsFailed(errors.New(errMsg))
+					t.OnComplete()
+					if t.GetTaskGroup() != nil {
+						taskGroup := t.GetTaskGroup()
+						taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+						if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
+							taskGroup.MarkComplete()
+						}
+					}
+					hasPanic = true
+				}
+
+				if hasPanic {
+					return
+				}
+
+				t.OnStart()
+				err := t.GetProvider().Handle(t, server)
+				if err != nil {
+					m.logger.Warn().Msgf("[minerva|%s|%s] Failed to handle task %d/%d: %s", provider, server, t.GetRetries(), t.GetMaxRetries(), err.Error())
+					t.UpdateRetries(t.GetRetries() + 1)
+					t.UpdateLastError(err.Error())
+					if t.GetRetries() <= t.GetMaxRetries() {
+						m.logger.Info().Msgf("[minerva|%s|%s] Retrying task %d/%d", provider, server, t.GetRetries(), t.GetMaxRetries())
+						//m.AddTask(t)
+						return
+					} else {
+						t.MarkAsFailed(err)
+						t.OnComplete()
+						m.logger.Error().Msgf("[minerva|%s|%s] Task failed after %d retries", provider, server, t.GetMaxRetries())
+						if t.GetTaskGroup() != nil {
+							taskGroup := t.GetTaskGroup()
+							taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+							if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
+								taskGroup.MarkComplete()
+							}
+						}
+						return
+					}
+				} else {
+					t.MarkAsSuccess()
+					t.OnComplete()
+					if t.GetTaskGroup() != nil {
+						taskGroup := t.GetTaskGroup()
+						taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+						if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
+							taskGroup.MarkComplete()
+						}
 					}
 				}
-			}
-		} else {
-			taskPriority.task.MarkAsSuccess()
-			taskPriority.task.OnComplete()
-			if taskPriority.task.GetTaskGroup() != nil {
-				taskGroup := taskPriority.task.GetTaskGroup()
-				taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-				if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-					taskGroup.MarkComplete()
-				}
-			}
-		}
+			}()
+		}()
 		m.cond[provider].L.Lock()
 	}
 }
