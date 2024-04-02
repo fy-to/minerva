@@ -153,6 +153,8 @@ func (p *Process) runWriter() {
 			// Send command
 			if err := p.stdin.Encode(cmd); err != nil {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
+				p.outputQueue <- map[string]interface{}{"id": cmd["id"], "type": "error", "message": "failed to send command"}
+				p.Restart()
 				continue
 			}
 			jsonCmd, _ := json.Marshal(cmd)
