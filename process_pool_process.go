@@ -36,6 +36,7 @@ type Process struct {
 	restarts        int
 	id              int
 	cwd             string
+	pool            *ProcessPool
 }
 
 type ProcessExport struct {
@@ -50,6 +51,10 @@ type ProcessExport struct {
 
 // Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
 func (p *Process) Start() {
+	if p.pool.shouldStop {
+		return
+	}
+
 	p.SetReady(0)
 	_cmd := exec.Command(p.cmdStr, p.cmdArgs...)
 	stdin, err := _cmd.StdinPipe()

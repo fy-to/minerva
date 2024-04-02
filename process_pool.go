@@ -11,24 +11,32 @@ import (
 )
 
 type ProcessPool struct {
-	processes []*Process
-	mutex     sync.RWMutex
-	logger    *zerolog.Logger
-	queue     ProcessPQ
+	processes  []*Process
+	mutex      sync.RWMutex
+	logger     *zerolog.Logger
+	queue      ProcessPQ
+	shouldStop bool
 }
 
 // NewProcessPool creates a new process pool.
 func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cwd string, cmd string, cmdArgs []string) *ProcessPool {
 	pool := &ProcessPool{
-		processes: make([]*Process, size),
-		logger:    logger,
-		mutex:     sync.RWMutex{},
+		processes:  make([]*Process, size),
+		logger:     logger,
+		mutex:      sync.RWMutex{},
+		shouldStop: false,
 	}
 	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout, cwd)
 	}
 	return pool
+}
+
+func (pool *ProcessPool) SetStop() {
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
+	pool.shouldStop = true
 }
 
 // newProcess creates a new process in the process pool.
@@ -48,6 +56,7 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		restarts:        0,
 		id:              i,
 		cwd:             cwd,
+		pool:            pool,
 	}
 	pool.mutex.Unlock()
 	pool.processes[i].Start()
@@ -126,6 +135,7 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 
 // StopAll stops all the processes in the process pool.
 func (pool *ProcessPool) StopAll() {
+	pool.SetStop()
 	for _, process := range pool.processes {
 		process.Stop()
 	}
