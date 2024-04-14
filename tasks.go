@@ -153,6 +153,7 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 	defer m.wg.Done()
 	m.lock[provider].Lock()
 	defer m.lock[provider].Unlock()
+
 	for {
 		for m.queueSizes[provider][server] == 0 {
 			select {
@@ -179,13 +180,7 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 					t.UpdateLastError(errMsg)
 					t.MarkAsFailed(errors.New(errMsg))
 					t.OnComplete()
-					if t.GetTaskGroup() != nil {
-						taskGroup := t.GetTaskGroup()
-						taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-						if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-							taskGroup.MarkComplete()
-						}
-					}
+					m.updateTaskGroupOnComplete(t)
 					hasPanic = true
 				}
 
@@ -201,35 +196,31 @@ func (m *TaskQueueManager) processQueue(provider, server string) {
 					t.UpdateLastError(err.Error())
 					if t.GetRetries() <= t.GetMaxRetries() {
 						m.logger.Info().Msgf("[minerva|%s|%s] Retrying task %d/%d", provider, server, t.GetRetries(), t.GetMaxRetries())
-						//m.AddTask(t)
-						return
+						heap.Push(m.queues[provider][server], &TaskPriority{task: t, priority: t.GetPriority()})
+						m.queueSizes[provider][server]++
 					} else {
 						t.MarkAsFailed(err)
 						t.OnComplete()
 						m.logger.Error().Msgf("[minerva|%s|%s] Task failed after %d retries", provider, server, t.GetMaxRetries())
-						if t.GetTaskGroup() != nil {
-							taskGroup := t.GetTaskGroup()
-							taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-							if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-								taskGroup.MarkComplete()
-							}
-						}
-						return
+						m.updateTaskGroupOnComplete(t)
 					}
 				} else {
 					t.MarkAsSuccess()
 					t.OnComplete()
-					if t.GetTaskGroup() != nil {
-						taskGroup := t.GetTaskGroup()
-						taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-						if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-							taskGroup.MarkComplete()
-						}
-					}
+					m.updateTaskGroupOnComplete(t)
 				}
 			}()
 		}()
 		m.cond[provider].L.Lock()
+	}
+}
+
+func (m *TaskQueueManager) updateTaskGroupOnComplete(t ITask) {
+	if taskGroup := t.GetTaskGroup(); taskGroup != nil {
+		taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
+		if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
+			taskGroup.MarkComplete()
+		}
 	}
 }
 
