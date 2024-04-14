@@ -16,6 +16,7 @@ type ProcessPool struct {
 	logger     *zerolog.Logger
 	queue      ProcessPQ
 	shouldStop int32
+	stop       chan bool
 }
 
 // NewProcessPool creates a new process pool.
@@ -26,6 +27,7 @@ func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, 
 		logger:     logger,
 		mutex:      sync.RWMutex{},
 		shouldStop: shouldStop,
+		stop:       make(chan bool, 1),
 	}
 	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
@@ -38,6 +40,7 @@ func (pool *ProcessPool) SetShouldStop(ready int32) {
 }
 func (pool *ProcessPool) SetStop() {
 	pool.SetShouldStop(1)
+	pool.stop <- true
 }
 
 // newProcess creates a new process in the process pool.

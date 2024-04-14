@@ -37,6 +37,7 @@ type Process struct {
 	id              int
 	cwd             string
 	pool            *ProcessPool
+	restarting      int32
 }
 
 type ProcessExport struct {
@@ -51,11 +52,11 @@ type ProcessExport struct {
 
 // Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
 func (p *Process) Start() {
-	if atomic.LoadInt32(&p.isReady) == 1 {
+	if atomic.LoadInt32(&p.pool.shouldStop) == 1 {
 		return
 	}
-
 	p.SetReady(0)
+	p.SetRestarting(0)
 	_cmd := exec.Command(p.cmdStr, p.cmdArgs...)
 	stdin, err := _cmd.StdinPipe()
 	if err != nil {
@@ -90,27 +91,47 @@ func (p *Process) Start() {
 	p.wg.Add(2)
 	go func() {
 		p.runReader()
-		p.wg.Done()
 		p.logger.Debug().Msgf("[minerva|%s] Reader stopped", p.name)
+		p.wg.Done()
 	}()
 
 	go func() {
 		p.runWriter()
-		p.wg.Done()
 		p.logger.Debug().Msgf("[minerva|%s] Writer stopped", p.name)
-	}()
 
+		p.wg.Done()
+	}()
 }
 
 // Stop stops the process by sending a kill signal to the process and cleaning up the resources.
 func (p *Process) Stop() {
 	p.SetReady(0)
-	p.mutex.Lock()
+
 	p.cancel()
-	p.mutex.Unlock()
-	p.wg.Wait()
+
+	done := make(chan bool)
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		p.cleanupChannelsAndResources()
+		p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
+	case <-time.After(1 * time.Second): // Set to whatever is reasonable
+		p.logger.Error().Msgf("[minerva|%s] Timeout waiting for goroutines to finish", p.name)
+		if p.cmd != nil && p.cmd.Process != nil {
+			p.cmd.Process.Kill()
+		}
+		p.cleanupChannelsAndResources()
+	}
+}
+
+func (p *Process) HardStop() {
+	p.SetReady(0)
+	p.cancel()
 	p.cmd.Process.Kill()
-	p.cleanupChannelsAndResources()
 	p.logger.Info().Msgf("[minerva|%s] Process stopped", p.name)
 }
 
@@ -131,11 +152,19 @@ func (p *Process) cleanupChannelsAndResources() {
 
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
-	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
+	if atomic.LoadInt32(&p.restarting) == 1 {
+		return
+	}
+	p.SetRestarting(1)
 	p.mutex.Lock()
 	p.restarts = p.restarts + 1
 	p.mutex.Unlock()
 	p.Stop()
+	if atomic.LoadInt32(&p.pool.shouldStop) == 1 {
+		return
+	}
+	p.logger.Info().Msgf("[minerva|%s] Restarting process", p.name)
+
 	p.Start()
 }
 
@@ -146,61 +175,68 @@ func (p *Process) SetReady(ready int32) {
 	atomic.StoreInt32(&p.isReady, ready)
 }
 
+func (p *Process) SetRestarting(restarting int32) {
+	atomic.StoreInt32(&p.restarting, restarting)
+}
+
 // IsReady returns true if the process is ready, false otherwise.
 func (p *Process) runWriter() {
+	p.logger.Info().Msgf("[minerva|%s] Writer started", p.name)
+	defer p.logger.Info().Msgf("[minerva|%s] Writer stopped", p.name)
 	for {
 		select {
 		case <-p.ctx.Done():
-			// Process stopped
-
+			p.logger.Debug().Msgf("[minerva|%s] Writer stopping: context done", p.name)
 			return
-		case cmd := <-p.inputQueue:
-			// Send command
+		case <-p.pool.stop:
+			p.logger.Debug().Msgf("[minerva|%s] Writer stopping: pool stopped (pool)", p.name)
+			return
+		case cmd, ok := <-p.inputQueue:
+			if !ok {
+				p.logger.Debug().Msgf("[minerva|%s] Input queue closed", p.name)
+				p.Restart()
+				return
+			}
 			if err := p.stdin.Encode(cmd); err != nil {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
-				p.outputQueue <- map[string]interface{}{"id": cmd["id"], "type": "error", "message": "failed to send command"}
-				p.Restart()
+				select {
+				case p.outputQueue <- map[string]interface{}{"id": cmd["id"], "type": "error", "message": "failed to send command"}:
+				case <-p.ctx.Done():
+					p.logger.Debug().Msgf("[minerva|%s] Context cancelled while handling error", p.name)
+					return
+				}
 				continue
 			}
-			jsonCmd, _ := json.Marshal(cmd)
-			p.logger.Debug().Msgf("[minerva|%s] Command sent: %v", p.name, string(jsonCmd))
-			id := cmd["id"].(string)
-			ch, _ := p.waitResponse.Load(id)
-			select {
-			case <-ch.(chan bool):
-				p.waitResponse.Delete(id)
-			case <-time.After(time.Duration(p.timeout) * time.Second):
-				p.logger.Error().Msgf("[minerva|%s] Command timed out", p.name)
-				p.outputQueue <- map[string]interface{}{"id": id, "type": "error", "message": "command timeout"}
-				p.waitResponse.Delete(id)
-				p.Restart()
-			}
-
+			p.logger.Debug().Msgf("[minerva|%s] Command sent", p.name)
 		}
 	}
 }
 
-// runReader reads the stdout of the process and sends the messages to the outputQueue.
 func (p *Process) runReader() {
+	p.logger.Info().Msgf("[minerva|%s] Reader started", p.name)
+	defer p.logger.Info().Msgf("[minerva|%s] Reader stopped", p.name)
 	outputChan := make(chan string)
 	go func() {
 		defer close(outputChan)
 		for {
 			line, err := p.stdout.ReadString('\n')
 			if err != nil {
-				if err != io.EOF {
+				if err == io.EOF {
+					p.logger.Debug().Msgf("[minerva|%s] EOF reached", p.name)
+				} else {
 					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
+					time.Sleep(time.Second)
+					p.Restart()
 				}
 				return
-			} else {
-				outputChan <- line
 			}
+			outputChan <- line
 		}
 	}()
 	for {
 		select {
 		case <-p.ctx.Done():
-			p.logger.Debug().Msgf("[minerva|%s] Context done", p.name)
+			p.logger.Debug().Msgf("[minerva|%s] Context done, Reader stopping", p.name)
 			return
 		case line, ok := <-outputChan:
 			if !ok {
