@@ -51,7 +51,7 @@ type ProcessExport struct {
 
 // Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
 func (p *Process) Start() {
-	if p.pool.shouldStop {
+	if atomic.LoadInt32(&p.isReady) == 1 {
 		return
 	}
 
@@ -173,6 +173,7 @@ func (p *Process) runWriter() {
 				p.logger.Error().Msgf("[minerva|%s] Command timed out", p.name)
 				p.outputQueue <- map[string]interface{}{"id": id, "type": "error", "message": "command timeout"}
 				p.waitResponse.Delete(id)
+				p.Restart()
 			}
 
 		}
@@ -204,6 +205,7 @@ func (p *Process) runReader() {
 		case line, ok := <-outputChan:
 			if !ok {
 				p.logger.Debug().Msgf("[minerva|%s] Output channel closed", p.name)
+				p.Restart()
 				return
 			}
 			if line == "" || line == "\n" {
