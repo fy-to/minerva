@@ -215,35 +215,43 @@ func (p *Process) runWriter() {
 func (p *Process) runReader() {
 	p.logger.Info().Msgf("[minerva|%s] Reader started", p.name)
 	defer p.logger.Info().Msgf("[minerva|%s] Reader stopped", p.name)
+
 	outputChan := make(chan string)
+	errorChan := make(chan error)
+
 	go func() {
 		defer close(outputChan)
+		defer close(errorChan)
+
 		for {
 			line, err := p.stdout.ReadString('\n')
 			if err != nil {
-				if err == io.EOF {
-					p.logger.Debug().Msgf("[minerva|%s] EOF reached", p.name)
-				} else {
-					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
-					time.Sleep(time.Second)
-					p.Restart()
-				}
+				errorChan <- err
 				return
 			}
 			outputChan <- line
 		}
 	}()
+
 	for {
 		select {
 		case <-p.ctx.Done():
 			p.logger.Debug().Msgf("[minerva|%s] Context done, Reader stopping", p.name)
 			return
-		case line, ok := <-outputChan:
-			if !ok {
-				p.logger.Debug().Msgf("[minerva|%s] Output channel closed", p.name)
+
+		case err := <-errorChan:
+			if err == io.EOF {
+				p.logger.Debug().Msgf("[minerva|%s] EOF reached", p.name)
+				p.outputQueue <- map[string]interface{}{"type": "error", "message": "EOF reached"}
 				p.Restart()
-				return
+			} else {
+				p.outputQueue <- map[string]interface{}{"type": "error", "message": err.Error()}
+				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
+				p.Restart()
 			}
+			return
+
+		case line := <-outputChan:
 			if line == "" || line == "\n" {
 				continue
 			}
@@ -252,21 +260,23 @@ func (p *Process) runReader() {
 				p.logger.Warn().Msgf("[minerva|%s] Non JSON message received: '%s'", p.name, line)
 				continue
 			}
-
-			if msg["type"] == "ready" {
-				p.logger.Info().Msgf("[minerva|%s] Process is ready", p.name)
-				p.SetReady(1)
-				continue
-			}
-
-			if msg["type"] == "success" || msg["type"] == "error" {
-				id := msg["id"].(string)
-				if ch, ok := p.waitResponse.Load(id); ok {
-					ch.(chan bool) <- true
-				}
-				p.outputQueue <- msg
-			}
+			handleMessage(p, msg)
 		}
+	}
+}
+
+func handleMessage(p *Process, msg map[string]interface{}) {
+	switch msg["type"] {
+	case "ready":
+		p.logger.Info().Msgf("[minerva|%s] Process is ready", p.name)
+		p.SetReady(1)
+
+	case "success", "error":
+		id := msg["id"].(string)
+		if ch, ok := p.waitResponse.Load(id); ok {
+			ch.(chan bool) <- true
+		}
+		p.outputQueue <- msg
 	}
 }
 
