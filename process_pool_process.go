@@ -302,6 +302,8 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 				return resp, nil
 			}
+		case <-time.After(time.Duration(p.timeout) * time.Millisecond):
+			return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "command timeout"}, nil
 		}
 	}
 }
