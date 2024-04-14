@@ -68,7 +68,7 @@ func (p *Process) Start() {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to get stdout pipe for process", p.name)
 		return
 	}
-
+	//
 	ctx, cancel := context.WithCancel(context.Background())
 	p.mutex.Lock()
 	p.ctx = ctx
