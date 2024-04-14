@@ -285,22 +285,23 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	p.inputQueue <- cmd
 	start := time.Now().UnixMilli()
 
-	select {
-	case <-p.ctx.Done():
-		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "process stopped"}, nil
-	case resp := <-p.outputQueue:
-		if resp["id"] == cmd["id"] {
-			p.mutex.Lock()
-			p.latency = time.Now().UnixMilli() - start
-			p.requestsHandled = p.requestsHandled + 1
-			p.mutex.Unlock()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "process stopped"}, nil
+		case resp := <-p.outputQueue:
+			if resp["id"] == cmd["id"] {
+				p.mutex.Lock()
+				p.latency = time.Now().UnixMilli() - start
+				p.requestsHandled = p.requestsHandled + 1
+				p.mutex.Unlock()
 
-			if resp["type"] == "error" && resp["message"] == "command timeout" {
-				p.Restart()
+				if resp["type"] == "error" && resp["message"] == "command timeout" {
+					p.Restart()
+				}
+
+				return resp, nil
 			}
-
-			return resp, nil
 		}
 	}
-	return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "unknown error"}, nil
 }
