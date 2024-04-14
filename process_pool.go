@@ -20,11 +20,12 @@ type ProcessPool struct {
 
 // NewProcessPool creates a new process pool.
 func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cwd string, cmd string, cmdArgs []string) *ProcessPool {
+	shouldStop := int32(0)
 	pool := &ProcessPool{
 		processes:  make([]*Process, size),
 		logger:     logger,
 		mutex:      sync.RWMutex{},
-		shouldStop: 0,
+		shouldStop: shouldStop,
 	}
 	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
@@ -36,8 +37,6 @@ func (pool *ProcessPool) SetShouldStop(ready int32) {
 	atomic.StoreInt32(&pool.shouldStop, ready)
 }
 func (pool *ProcessPool) SetStop() {
-	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
 	pool.SetShouldStop(1)
 }
 
@@ -106,10 +105,10 @@ func (pool *ProcessPool) WaitForReady(maxTime time.Duration) error {
 	start := time.Now()
 	for {
 		pool.mutex.RLock()
-		ready := true
+		ready := false
 		for _, process := range pool.processes {
-			if atomic.LoadInt32(&process.isReady) == 0 {
-				ready = false
+			if atomic.LoadInt32(&process.isReady) == 1 {
+				ready = true
 				break
 			}
 		}
