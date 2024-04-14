@@ -70,7 +70,7 @@ func (p *Process) Start() {
 	p.cmd = _cmd
 	p.stdin = json.NewEncoder(stdin)
 	p.stdout = bufio.NewReader(stdout)
-	p.inputQueue = make(chan map[string]interface{}, 100)
+	p.inputQueue = make(chan map[string]interface{}, 1000)
 	p.wg = sync.WaitGroup{}
 	p.waitResponse = sync.Map{}
 	p.mutex.Unlock()
