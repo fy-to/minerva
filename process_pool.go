@@ -67,6 +67,15 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 
 }
 
+func lenSyncMap(m *sync.Map) int {
+	var i int
+	m.Range(func(k, v interface{}) bool {
+		i++
+		return true
+	})
+	return i
+}
+
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
 	pool.mutex.RLock()
@@ -79,7 +88,7 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
 				Latency:         process.latency,
 				InputQueue:      len(process.inputQueue),
-				OutputQueue:     len(process.outputQueue),
+				OutputQueue:     lenSyncMap(&process.waitResponse),
 				Name:            process.name,
 				Restarts:        process.restarts,
 				RequestsHandled: process.requestsHandled,

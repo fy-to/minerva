@@ -17,7 +17,6 @@ import (
 type Process struct {
 	cmd             *exec.Cmd
 	inputQueue      chan map[string]interface{}
-	outputQueue     chan map[string]interface{}
 	isReady         int32
 	latency         int64
 	mutex           sync.RWMutex
@@ -77,7 +76,6 @@ func (p *Process) Start() {
 	p.stdin = json.NewEncoder(stdin)
 	p.stdout = bufio.NewReader(stdout)
 	p.inputQueue = make(chan map[string]interface{}, 10000)
-	p.outputQueue = make(chan map[string]interface{}, 10000)
 	p.wg = sync.WaitGroup{}
 	p.waitResponse = sync.Map{}
 	p.mutex.Unlock()
@@ -139,7 +137,6 @@ func (p *Process) HardStop() {
 func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Lock()
 	close(p.inputQueue)
-	close(p.outputQueue)
 	p.cmd = nil
 	p.stdin = nil
 	p.stdout = nil
@@ -199,13 +196,7 @@ func (p *Process) runWriter() {
 			}
 			if err := p.stdin.Encode(cmd); err != nil {
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
-				select {
-				case p.outputQueue <- map[string]interface{}{"id": cmd["id"], "type": "error", "message": "failed to send command"}:
-				case <-p.ctx.Done():
-					p.logger.Debug().Msgf("[minerva|%s] Context cancelled while handling error", p.name)
-					return
-				}
-				continue
+				p.Restart()
 			}
 			p.logger.Debug().Msgf("[minerva|%s] Command sent", p.name)
 		}
@@ -242,10 +233,10 @@ func (p *Process) runReader() {
 		case err := <-errorChan:
 			if err == io.EOF {
 				p.logger.Debug().Msgf("[minerva|%s] EOF reached", p.name)
-				p.outputQueue <- map[string]interface{}{"type": "error", "message": "EOF reached"}
+				handleMessage(p, map[string]interface{}{"type": "error", "message": "EOF"})
 				p.Restart()
 			} else {
-				p.outputQueue <- map[string]interface{}{"type": "error", "message": err.Error()}
+				handleMessage(p, map[string]interface{}{"type": "error", "message": err.Error()})
 				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
 				p.Restart()
 			}
@@ -274,9 +265,10 @@ func handleMessage(p *Process, msg map[string]interface{}) {
 	case "success", "error":
 		id := msg["id"].(string)
 		if ch, ok := p.waitResponse.Load(id); ok {
-			ch.(chan bool) <- true
+			ch := ch.(chan map[string]interface{})
+			ch <- msg // Send the response message on the retrieved channel
+			p.waitResponse.Delete(id)
 		}
-		p.outputQueue <- msg
 	}
 }
 
@@ -289,31 +281,32 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		cmd["type"] = "main"
 	}
 
-	ch := make(chan bool, 1)
-	p.waitResponse.Store(cmd["id"].(string), ch)
+	// Use sync.Map to store process response with command ID as key and a channel for notification as value
+	responseCh := make(chan map[string]interface{}, 1)
+	p.waitResponse.Store(cmd["id"].(string), responseCh)
 
 	p.inputQueue <- cmd
 	start := time.Now().UnixMilli()
 
-	for {
-		select {
-		case <-p.ctx.Done():
-			return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "process stopped"}, nil
-		case resp := <-p.outputQueue:
-			if resp["id"] == cmd["id"] {
-				p.mutex.Lock()
-				p.latency = time.Now().UnixMilli() - start
-				p.requestsHandled = p.requestsHandled + 1
-				p.mutex.Unlock()
+	select {
+	case <-p.ctx.Done():
+		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "process stopped"}, nil
+	case resp := <-responseCh:
+		p.mutex.Lock()
+		p.latency = time.Now().UnixMilli() - start
+		p.requestsHandled = p.requestsHandled + 1
+		p.mutex.Unlock()
 
-				if resp["type"] == "error" && resp["message"] == "command timeout" {
-					p.Restart()
-				}
-
-				return resp, nil
-			}
-		case <-time.After(time.Duration(p.timeout) * time.Second):
-			return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "command timeout"}, nil
+		if resp["type"] == "error" && resp["message"] == "command timeout" {
+			p.Restart()
 		}
+
+		// Remove response from waitResponse after processing
+		p.waitResponse.Delete(cmd["id"].(string))
+		return resp, nil
+	case <-time.After(time.Duration(p.timeout) * time.Second):
+		// Remove timed out response from waitResponse
+		p.waitResponse.Delete(cmd["id"].(string))
+		return map[string]interface{}{"id": cmd["id"], "type": "error", "message": "command timeout"}, nil
 	}
 }
