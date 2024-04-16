@@ -87,8 +87,6 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 			exports = append(exports, ProcessExport{
 				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
 				Latency:         process.latency,
-				InputQueue:      len(process.inputQueue),
-				OutputQueue:     lenSyncMap(&process.waitResponse),
 				Name:            process.name,
 				Restarts:        process.restarts,
 				RequestsHandled: process.requestsHandled,
@@ -206,9 +204,8 @@ func (pq *ProcessPQ) Update() {
 	for _, process := range pq.pool.processes {
 		if atomic.LoadInt32(&process.isReady) == 1 {
 			pq.Push(&ProcessWithPrio{
-				processId:   process.id,
-				queueLength: len(process.inputQueue),
-				handled:     process.requestsHandled,
+				processId: process.id,
+				handled:   process.requestsHandled,
 			})
 		}
 	}
