@@ -11,27 +11,43 @@ import (
 )
 
 type ProcessPool struct {
-	processes  []*Process
-	mutex      sync.RWMutex
-	logger     *zerolog.Logger
-	queue      ProcessPQ
-	shouldStop int32
-	stop       chan bool
+	processes     []*Process
+	mutex         sync.RWMutex
+	logger        *zerolog.Logger
+	queue         ProcessPQ
+	shouldStop    int32
+	stop          chan bool
+	workerTimeout time.Duration
+	comTimeout    time.Duration
+	initTimeout   time.Duration
 }
 
 // NewProcessPool creates a new process pool.
-func NewProcessPool(name string, timeout int, size int, logger *zerolog.Logger, cwd string, cmd string, cmdArgs []string) *ProcessPool {
+func NewProcessPool(
+	name string,
+	size int,
+	logger *zerolog.Logger,
+	cwd string,
+	cmd string,
+	cmdArgs []string,
+	workerTimeout time.Duration,
+	comTimeout time.Duration,
+	initTimeout time.Duration,
+) *ProcessPool {
 	shouldStop := int32(0)
 	pool := &ProcessPool{
-		processes:  make([]*Process, size),
-		logger:     logger,
-		mutex:      sync.RWMutex{},
-		shouldStop: shouldStop,
-		stop:       make(chan bool, 1),
+		processes:     make([]*Process, size),
+		logger:        logger,
+		mutex:         sync.RWMutex{},
+		shouldStop:    shouldStop,
+		stop:          make(chan bool, 1),
+		workerTimeout: workerTimeout,
+		comTimeout:    comTimeout,
+		initTimeout:   initTimeout,
 	}
 	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
 	for i := 0; i < size; i++ {
-		pool.newProcess(name, i, cmd, cmdArgs, logger, timeout, cwd)
+		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
 	return pool
 }
@@ -44,7 +60,7 @@ func (pool *ProcessPool) SetStop() {
 }
 
 // newProcess creates a new process in the process pool.
-func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, timeout int, cwd string) {
+func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, cwd string) {
 
 	pool.mutex.Lock()
 
@@ -55,7 +71,8 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		name:            fmt.Sprintf("%s#%d", name, i),
 		cmdStr:          cmd,
 		cmdArgs:         cmdArgs,
-		timeout:         timeout,
+		timeout:         pool.comTimeout,
+		initTimeout:     pool.initTimeout,
 		requestsHandled: 0,
 		restarts:        0,
 		id:              i,
@@ -100,18 +117,27 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
-	pool.queue.Update()
+	timeoutTimer := time.After(pool.workerTimeout)
+	ticker := time.NewTicker(time.Millisecond * 100)
+	defer ticker.Stop()
 
-	if pool.queue.Len() == 0 {
-		return nil, fmt.Errorf("no available workers")
+	for {
+		select {
+		case <-timeoutTimer:
+			return nil, fmt.Errorf("timeout exceeded, no available workers")
+		case <-ticker.C:
+			pool.queue.Update()
+			if pool.queue.Len() > 0 {
+				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
+				pool.processes[processWithPrio.processId].SetBusy(1)
+				return pool.processes[processWithPrio.processId], nil
+			}
+		}
 	}
-
-	processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
-	return pool.processes[processWithPrio.processId], nil
 }
 
 // Should wait for X seconds until at least one worker is ready
-func (pool *ProcessPool) WaitForReady(maxTime time.Duration) error {
+func (pool *ProcessPool) WaitForReady() error {
 	start := time.Now()
 	for {
 		pool.mutex.RLock()
@@ -126,7 +152,7 @@ func (pool *ProcessPool) WaitForReady(maxTime time.Duration) error {
 		if ready {
 			return nil
 		}
-		if time.Since(start) > maxTime {
+		if time.Since(start) > pool.initTimeout {
 			return fmt.Errorf("timeout waiting for workers to be ready")
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -198,8 +224,8 @@ func (pq *ProcessPQ) Update() {
 
 	pq.processes = nil
 
-	pq.pool.mutex.RLock()
-	defer pq.pool.mutex.RUnlock()
+	pq.pool.mutex.Lock()
+	defer pq.pool.mutex.Unlock()
 
 	for _, process := range pq.pool.processes {
 		if process != nil && process.IsReady() && !process.IsBusy() {

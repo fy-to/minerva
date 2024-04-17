@@ -26,7 +26,8 @@ type Process struct {
 	name            string
 	cmdStr          string
 	cmdArgs         []string
-	timeout         int
+	timeout         time.Duration
+	initTimeout     time.Duration
 	requestsHandled int
 	restarts        int
 	id              int
@@ -157,7 +158,7 @@ func (p *Process) WaitForReadyScan() {
 	case err := <-errChan:
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
 		p.Restart()
-	case <-time.After(20 * time.Second):
+	case <-time.After(p.initTimeout):
 		p.logger.Error().Msgf("[minerva|%s] Communication timed out", p.name)
 		p.Restart()
 	}
@@ -178,7 +179,7 @@ func (p *Process) Communicate(cmd map[string]interface{}) (map[string]interface{
 	responseChan := make(chan map[string]interface{}, 1)
 	errChan := make(chan error, 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.timeout)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 	go func() {
 		defer func() {
@@ -232,7 +233,6 @@ func (p *Process) Communicate(cmd map[string]interface{}) (map[string]interface{
 
 // SendCommand sends a command to the process and waits for the response.
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
-	p.SetBusy(1)
 	defer p.SetBusy(0)
 
 	if _, ok := cmd["id"]; !ok {
