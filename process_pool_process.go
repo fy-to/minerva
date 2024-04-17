@@ -17,6 +17,7 @@ import (
 type Process struct {
 	cmd             *exec.Cmd
 	isReady         int32
+	isBusy          int32
 	latency         int64
 	mutex           sync.RWMutex
 	logger          *zerolog.Logger
@@ -64,13 +65,11 @@ func (p *Process) Start() {
 	p.stdout = bufio.NewReader(stdout)
 	p.mutex.Unlock()
 	p.cmd.Dir = p.cwd
+	go p.WaitForReadyScan()
 	if err := p.cmd.Start(); err != nil {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to start process", p.name)
 		return
 	}
-
-	p.logger.Info().Msgf("[minerva|%s] Process started", p.name)
-	p.WaitForReadyScan()
 }
 
 // Stop stops the process by sending a kill signal to the process and cleaning up the resources.
@@ -111,68 +110,18 @@ func (p *Process) SetReady(ready int32) {
 	atomic.StoreInt32(&p.isReady, ready)
 }
 
-// IsReady returns true if the process is ready, false otherwise.
-/*
-func (p *Process) runWriter() {
-	for {
-		select {
-		case <-p.ctx.Done():
-			// Process stopped
-
-			return
-		case cmd := <-p.inputQueue:
-			// Send command
-			if err := p.stdin.Encode(cmd); err != nil {
-				p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to send command", p.name)
-				p.Restart()
-				continue
-			}
-			jsonCmd, _ := json.Marshal(cmd)
-			p.logger.Debug().Msgf("[minerva|%s] Command sent: %v", p.name, string(jsonCmd))
-		}
-	}
+func (p *Process) IsReady() bool {
+	return atomic.LoadInt32(&p.isReady) == 1
 }
 
-func (p *Process) runReader() {
-	outputChan := make(chan string)
-	go func() {
-		defer close(outputChan)
-		for {
-			line, err := p.stdout.ReadString('\n')
-			if err != nil {
-				if err != io.EOF {
-					p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
-				}
-				p.Restart()
-				return
-			} else {
-				outputChan <- line
-			}
-		}
-	}()
-	for {
-		select {
-		case <-p.ctx.Done():
-			p.logger.Debug().Msgf("[minerva|%s] Context done", p.name)
-			return
-		case line, ok := <-outputChan:
-			if !ok {
-				p.logger.Debug().Msgf("[minerva|%s] Output channel closed", p.name)
-				return
-			}
-			if line == "" || line == "\n" {
-				continue
-			}
-			var msg map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				p.logger.Warn().Msgf("[minerva|%s] Non JSON message received: '%s'", p.name, line)
-				continue
-			}
-			p.handleMessage(msg)
-		}
-	}
+func (p *Process) IsBusy() bool {
+	return atomic.LoadInt32(&p.isBusy) == 1
 }
-*/
+
+func (p *Process) SetBusy(busy int32) {
+	atomic.StoreInt32(&p.isBusy, busy)
+}
+
 func (p *Process) WaitForReadyScan() {
 	responseChan := make(chan map[string]interface{}, 1)
 	errChan := make(chan error, 1)
@@ -203,6 +152,7 @@ func (p *Process) WaitForReadyScan() {
 	select {
 	case <-responseChan:
 		p.SetReady(1)
+		p.SetBusy(0)
 		return
 	case err := <-errChan:
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read line", p.name)
@@ -282,6 +232,9 @@ func (p *Process) Communicate(cmd map[string]interface{}) (map[string]interface{
 
 // SendCommand sends a command to the process and waits for the response.
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
+	p.SetBusy(1)
+	defer p.SetBusy(0)
+
 	if _, ok := cmd["id"]; !ok {
 		cmd["id"] = uuid.New().String()
 	}

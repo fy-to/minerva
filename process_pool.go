@@ -202,7 +202,7 @@ func (pq *ProcessPQ) Update() {
 	defer pq.pool.mutex.RUnlock()
 
 	for _, process := range pq.pool.processes {
-		if atomic.LoadInt32(&process.isReady) == 1 {
+		if process != nil && process.IsReady() && !process.IsBusy() {
 			pq.Push(&ProcessWithPrio{
 				processId: process.id,
 				handled:   process.requestsHandled,
