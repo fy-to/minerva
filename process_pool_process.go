@@ -178,7 +178,7 @@ func (p *Process) Communicate(cmd map[string]interface{}) (map[string]interface{
 	responseChan := make(chan map[string]interface{}, 1)
 	errChan := make(chan error, 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.timeout)*time.Second)
 	defer cancel()
 	go func() {
 		defer func() {
