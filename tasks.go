@@ -2,6 +2,7 @@ package minerva
 
 import (
 	"container/heap"
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type ITask interface {
 	GetTaskGroup() ITaskGroup
 	GetProvider() IProvider
 	UpdateRetries(int) error
+	GetTimeout() time.Duration
 	UpdateLastError(string) error
 	OnComplete()
 	OnStart()
@@ -183,19 +185,49 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 	}()
 
 	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
+	task.OnStart()
 
-	if err := task.GetProvider().Handle(task, server); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), task.GetTimeout())
+	defer cancel() // Ensure that the cancel function is called to release resources.
+
+	// Wrap the Handle function to respect the context cancellation or timeout.
+	err := func() error {
+		done := make(chan error, 1)
+		go func() {
+			done <- task.GetProvider().Handle(task, server)
+		}()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // Returns context.DeadlineExceeded if the timeout was reached
+		case err := <-done:
+			return err
+		}
+	}()
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Task handling exceeded timeout", providerName, server)
+		} else {
+			m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+		}
+
 		task.UpdateLastError(err.Error())
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
-		if retries >= maxRetries && maxRetries != 0 {
+		if retries >= maxRetries || maxRetries <= 1 {
 			task.MarkAsFailed(err)
+			task.OnComplete()
 			return nil
 		}
 		task.UpdateRetries(retries + 1)
+		m.AddTask(task)
 		return err
 	}
+
+	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
 	task.MarkAsSuccess()
+	task.OnComplete()
 	return nil
 }
 
