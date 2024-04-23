@@ -10,7 +10,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Interfaces definition for tasks, task groups, and providers
 type ITask interface {
 	MarkAsSuccess()
 	MarkAsFailed(err error)
@@ -39,14 +38,12 @@ type IProvider interface {
 	Name() string
 }
 
-// TaskPriority wraps a task with its priority and position in the queue
 type TaskPriority struct {
 	task     ITask
 	priority int
 	index    int
 }
 
-// PriorityQueue for managing tasks based on priority
 type PriorityQueue []*TaskPriority
 
 func (pq PriorityQueue) Len() int { return len(pq) }
@@ -71,12 +68,11 @@ func (pq *PriorityQueue) Pop() interface{} {
 	old := *pq
 	n := len(old)
 	item := old[n-1]
-	item.index = -1 // for safety
+	item.index = -1
 	*pq = old[:n-1]
 	return item
 }
 
-// TaskQueueManager manages task queues for different providers and servers
 type TaskQueueManager struct {
 	queues     map[string]map[string]*PriorityQueue
 	lock       map[string]*sync.Mutex
@@ -88,7 +84,6 @@ type TaskQueueManager struct {
 	wg         sync.WaitGroup
 }
 
-// NewTaskQueueManager creates a new TaskQueueManager
 func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string) *TaskQueueManager {
 	tm := &TaskQueueManager{
 		queues:     make(map[string]map[string]*PriorityQueue),
@@ -117,9 +112,7 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 	return tm
 }
 
-// Start begins processing tasks in all queues
 func (m *TaskQueueManager) Start(tasks []ITask) {
-
 	for providerName, serverMap := range m.queues {
 		for server := range serverMap {
 			m.wg.Add(1)
@@ -132,7 +125,6 @@ func (m *TaskQueueManager) Start(tasks []ITask) {
 	}
 }
 
-// AddTask adds a task to the appropriate queue based on its provider and server
 func (m *TaskQueueManager) AddTask(task ITask) {
 	providerName := task.GetProvider().Name()
 	if _, ok := m.queues[providerName]; !ok {
@@ -144,13 +136,13 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	server := m.selectServerWithLowestQueue(providerName)
 	m.lock[providerName].Lock()
 	heap.Push(m.queues[providerName][server], &TaskPriority{task: task, priority: task.GetPriority()})
+	queueSize := m.queueSizes[providerName][server]
 	m.queueSizes[providerName][server]++
-	m.cond[providerName].Signal()
+	m.cond[providerName].Broadcast()
 	m.lock[providerName].Unlock()
-	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue, position: %d", providerName, server, m.queueSizes[providerName][server])
+	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
 }
 
-// processQueue processes tasks from a specific queue for a provider and server
 func (m *TaskQueueManager) processQueue(providerName, server string) {
 	m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
 	defer m.wg.Done()
@@ -177,7 +169,6 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 	}
 }
 
-// handleTask tries to handle a task and manages retries and errors
 func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) error {
 	defer func() {
 		if r := recover(); r != nil {
@@ -189,9 +180,8 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 	task.OnStart()
 
 	ctx, cancel := context.WithTimeout(context.Background(), task.GetTimeout())
-	defer cancel() // Ensure that the cancel function is called to release resources.
+	defer cancel()
 
-	// Wrap the Handle function to respect the context cancellation or timeout.
 	err := func() error {
 		done := make(chan error, 1)
 		go func() {
@@ -200,7 +190,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err() // Returns context.DeadlineExceeded if the timeout was reached
+			return ctx.Err()
 		case err := <-done:
 			return err
 		}
@@ -216,7 +206,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		task.UpdateLastError(err.Error())
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
-		if retries >= maxRetries || maxRetries <= 1 {
+		if retries >= maxRetries {
 			task.MarkAsFailed(err)
 			task.OnComplete()
 			return nil
@@ -232,9 +222,8 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 	return nil
 }
 
-// selectServerWithLowestQueue selects the server with the lowest number of queued tasks
 func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) string {
-	minQueue := int(^uint(0) >> 1) // Max int
+	minQueue := int(^uint(0) >> 1)
 	var selectedServer string
 	for server, queueSize := range m.queueSizes[providerName] {
 		if queueSize < minQueue {
@@ -245,7 +234,6 @@ func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) stri
 	return selectedServer
 }
 
-// Shutdown signals all processing to stop and waits for completion
 func (m *TaskQueueManager) Shutdown() {
 	close(m.shutdownCh)
 	m.wg.Wait()
