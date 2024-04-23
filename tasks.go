@@ -3,17 +3,16 @@ package minerva
 import (
 	"container/heap"
 	"errors"
-	"fmt"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
+// Interfaces definition for tasks, task groups, and providers
 type ITask interface {
 	MarkAsSuccess()
-	MarkAsFailed(error)
+	MarkAsFailed(err error)
 	GetPriority() int
 	GetMaxRetries() int
 	GetRetries() int
@@ -34,10 +33,48 @@ type ITaskGroup interface {
 }
 
 type IProvider interface {
-	Handle(ITask, string) error
+	Handle(task ITask, server string) error
 	Name() string
 }
 
+// TaskPriority wraps a task with its priority and position in the queue
+type TaskPriority struct {
+	task     ITask
+	priority int
+	index    int
+}
+
+// PriorityQueue for managing tasks based on priority
+type PriorityQueue []*TaskPriority
+
+func (pq PriorityQueue) Len() int { return len(pq) }
+func (pq PriorityQueue) Less(i, j int) bool {
+	if pq[i].priority == pq[j].priority {
+		return pq[i].task.GetCreatedAt().Before(pq[j].task.GetCreatedAt())
+	}
+	return pq[i].priority < pq[j].priority
+}
+func (pq PriorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+func (pq *PriorityQueue) Push(x interface{}) {
+	n := len(*pq)
+	item := x.(*TaskPriority)
+	item.index = n
+	*pq = append(*pq, item)
+}
+func (pq *PriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	item.index = -1 // for safety
+	*pq = old[:n-1]
+	return item
+}
+
+// TaskQueueManager manages task queues for different providers and servers
 type TaskQueueManager struct {
 	queues     map[string]map[string]*PriorityQueue
 	lock       map[string]*sync.Mutex
@@ -49,6 +86,7 @@ type TaskQueueManager struct {
 	wg         sync.WaitGroup
 }
 
+// NewTaskQueueManager creates a new TaskQueueManager
 func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string) *TaskQueueManager {
 	tm := &TaskQueueManager{
 		queues:     make(map[string]map[string]*PriorityQueue),
@@ -77,156 +115,105 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 	return tm
 }
 
+// Start begins processing tasks in all queues
 func (m *TaskQueueManager) Start(tasks []ITask) {
 
-	for _, provider := range *m.providers {
-		for server := range m.queues[provider.Name()] {
-			m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", provider.Name(), server)
-			go m.processQueue(provider.Name(), server)
+	for providerName, serverMap := range m.queues {
+		for server := range serverMap {
+			m.wg.Add(1)
+			go m.processQueue(providerName, server)
 		}
 	}
 
 	for _, task := range tasks {
 		m.AddTask(task)
 	}
-
 }
-func (m *TaskQueueManager) selectServerWithLowestQueue(provider string) string {
-	lowestSize := math.MaxInt
-	lowestServer := ""
 
-	for server, size := range m.queueSizes[provider] {
-		if size == 0 {
-			return server
-		}
-		if size < lowestSize {
-			lowestSize = size
-			lowestServer = server
-		}
+// AddTask adds a task to the appropriate queue based on its provider and server
+func (m *TaskQueueManager) AddTask(task ITask) {
+	providerName := task.GetProvider().Name()
+	if _, ok := m.queues[providerName]; !ok {
+		m.logger.Error().Msgf("[minerva|%s] Invalid provider", providerName)
+		task.MarkAsFailed(errors.New("invalid provider"))
+		return
 	}
 
-	return lowestServer
+	server := m.selectServerWithLowestQueue(providerName)
+	m.lock[providerName].Lock()
+	heap.Push(m.queues[providerName][server], &TaskPriority{task: task, priority: task.GetPriority()})
+	m.queueSizes[providerName][server]++
+	m.cond[providerName].Signal()
+	m.lock[providerName].Unlock()
 }
-func (m *TaskQueueManager) AddTask(task ITask) {
-	panicked := false
-	var provider string
-	var server string
 
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errMsg := fmt.Sprintf("Recovered from panic: %v", r)
-				m.logger.Error().Msgf("[minerva] recovered from panic: %s", errMsg)
-				panicked = true
+// processQueue processes tasks from a specific queue for a provider and server
+func (m *TaskQueueManager) processQueue(providerName, server string) {
+	m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
+	defer m.wg.Done()
+	for {
+		select {
+		case <-m.shutdownCh:
+			return
+		default:
+			m.lock[providerName].Lock()
+			for m.queueSizes[providerName][server] == 0 {
+				m.cond[providerName].Wait()
 			}
-		}()
 
-		provider = task.GetProvider().Name()
-		server = m.selectServerWithLowestQueue(provider)
+			taskPriority := heap.Pop(m.queues[providerName][server]).(*TaskPriority)
+			task := taskPriority.task
+			m.queueSizes[providerName][server]--
+			m.lock[providerName].Unlock()
+
+			if err := m.handleTask(task, providerName, server); err != nil {
+				m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+				m.AddTask(task) // Requeue task if handling fails and not exceeded retries
+			}
+		}
+	}
+}
+
+// handleTask tries to handle a task and manages retries and errors
+func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) error {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error().Msgf("[minerva|%s|%s] Recovered from panic: %v", providerName, server, r)
+		}
 	}()
 
-	if panicked {
-		return
-	}
-	// check if provider is not nil and is in the list of providers by checking m.queues for exemple
-	if _, ok := m.queues[provider]; !ok {
-		m.logger.Error().Msgf("[minerva|%s|%s] Provider not found", provider, server)
-		return
-	}
-	m.lock[provider].Lock()
-	defer m.lock[provider].Unlock()
-	if _, ok := m.queues[provider][server]; !ok {
-		m.queues[provider][server] = &PriorityQueue{}
-	}
+	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 
-	heap.Push(m.queues[provider][server], &TaskPriority{
-		task:     task,
-		priority: task.GetPriority(),
-	})
-	m.logger.Info().Msgf("[minerva|%s|%s] Added task with priority %d to queue (%d/%d)", provider, server, task.GetPriority(), task.GetRetries(), task.GetMaxRetries())
-	m.queueSizes[provider][server]++
-	m.cond[provider].Signal()
-}
-
-func (m *TaskQueueManager) processQueue(provider, server string) {
-	m.wg.Add(1)
-	defer m.wg.Done()
-	m.lock[provider].Lock()
-	defer m.lock[provider].Unlock()
-
-	for {
-		for m.queueSizes[provider][server] == 0 {
-			select {
-			case <-m.shutdownCh:
-				m.lock[provider].Unlock()
-				return
-			default:
-				m.cond[provider].Wait()
-			}
+	if err := task.GetProvider().Handle(task, server); err != nil {
+		task.UpdateLastError(err.Error())
+		retries := task.GetRetries()
+		maxRetries := task.GetMaxRetries()
+		if retries >= maxRetries && maxRetries != 0 {
+			task.MarkAsFailed(err)
+			return nil
 		}
-		taskPriority := heap.Pop(m.queues[provider][server]).(*TaskPriority)
-		t := taskPriority.task
-		m.queueSizes[provider][server]--
-
-		m.cond[provider].L.Unlock()
-		hasPanic := false
-
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					errMsg := fmt.Sprintf("Recovered from panic: %v", r)
-					m.logger.Error().Msgf("[minerva|%s|%s] recovered from panic: %s", provider, server, errMsg)
-
-					t.UpdateLastError(errMsg)
-					t.MarkAsFailed(errors.New(errMsg))
-					t.OnComplete()
-					m.updateTaskGroupOnComplete(t)
-					hasPanic = true
-				}
-
-				if hasPanic {
-					return
-				}
-
-				t.OnStart()
-				err := t.GetProvider().Handle(t, server)
-				if err != nil {
-					m.logger.Warn().Msgf("[minerva|%s|%s] Failed to handle task %d/%d: %s", provider, server, t.GetRetries(), t.GetMaxRetries(), err.Error())
-					t.UpdateRetries(t.GetRetries() + 1)
-					t.UpdateLastError(err.Error())
-					if t.GetRetries() <= t.GetMaxRetries() {
-						m.logger.Info().Msgf("[minerva|%s|%s] Retrying task %d/%d", provider, server, t.GetRetries(), t.GetMaxRetries())
-						heap.Push(m.queues[provider][server], &TaskPriority{task: t, priority: t.GetPriority()})
-						m.queueSizes[provider][server]++
-					} else {
-						t.MarkAsFailed(err)
-						t.OnComplete()
-						m.logger.Error().Msgf("[minerva|%s|%s] Task failed after %d retries", provider, server, t.GetMaxRetries())
-						m.updateTaskGroupOnComplete(t)
-					}
-				} else {
-					t.MarkAsSuccess()
-					t.OnComplete()
-					m.updateTaskGroupOnComplete(t)
-				}
-			}()
-		}()
-		m.cond[provider].L.Lock()
+		task.UpdateRetries(retries + 1)
+		return err
 	}
+	task.MarkAsSuccess()
+	return nil
 }
 
-func (m *TaskQueueManager) updateTaskGroupOnComplete(t ITask) {
-	if taskGroup := t.GetTaskGroup(); taskGroup != nil {
-		taskGroup.UpdateTaskCompletedCount(taskGroup.GetTaskCompletedCount() + 1)
-		if taskGroup.GetTaskCount() == taskGroup.GetTaskCompletedCount() {
-			taskGroup.MarkComplete()
+// selectServerWithLowestQueue selects the server with the lowest number of queued tasks
+func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) string {
+	minQueue := int(^uint(0) >> 1) // Max int
+	var selectedServer string
+	for server, queueSize := range m.queueSizes[providerName] {
+		if queueSize < minQueue {
+			minQueue = queueSize
+			selectedServer = server
 		}
 	}
+	return selectedServer
 }
 
+// Shutdown signals all processing to stop and waits for completion
 func (m *TaskQueueManager) Shutdown() {
 	close(m.shutdownCh)
 	m.wg.Wait()
-
-	m.logger.Info().Msg("TaskQueueManager shutdown complete.")
 }
