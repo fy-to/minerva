@@ -147,6 +147,7 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	m.queueSizes[providerName][server]++
 	m.cond[providerName].Signal()
 	m.lock[providerName].Unlock()
+	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue, position: %d", providerName, server, m.queueSizes[providerName][server])
 }
 
 // processQueue processes tasks from a specific queue for a provider and server
