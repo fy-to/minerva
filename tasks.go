@@ -114,12 +114,11 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 }
 func (m *TaskQueueManager) HasTaskInQueue(task ITask) bool {
 	providerName := task.GetProvider().Name()
-	server := m.selectServerWithLowestQueue(providerName)
-	m.lock[providerName].Lock()
-	defer m.lock[providerName].Unlock()
-	for _, taskPriority := range *m.queues[providerName][server] {
-		if taskPriority.task.GetID() == task.GetID() {
-			return true
+	for _, serverQueue := range m.queues[providerName] {
+		for _, taskPriority := range *serverQueue {
+			if taskPriority.task.GetID() == task.GetID() {
+				return true
+			}
 		}
 	}
 	return false
@@ -140,11 +139,14 @@ func (m *TaskQueueManager) Start(tasks []ITask) {
 
 func (m *TaskQueueManager) AddTask(task ITask) {
 	providerName := task.GetProvider().Name()
+
 	if _, ok := m.queues[providerName]; !ok {
 		m.logger.Error().Msgf("[minerva|%s] Invalid provider", providerName)
 		task.MarkAsFailed(errors.New("invalid provider"))
 		return
 	}
+	m.lock[providerName].Lock()
+	defer m.lock[providerName].Unlock()
 
 	if m.HasTaskInQueue(task) {
 		m.logger.Info().Msgf("[minerva|%s] Task already in queue", providerName)
@@ -152,12 +154,10 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	}
 
 	server := m.selectServerWithLowestQueue(providerName)
-	m.lock[providerName].Lock()
 	heap.Push(m.queues[providerName][server], &TaskPriority{task: task, priority: task.GetPriority()})
 	queueSize := m.queueSizes[providerName][server]
 	m.queueSizes[providerName][server]++
 	m.cond[providerName].Broadcast()
-	m.lock[providerName].Unlock()
 	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
 }
 
