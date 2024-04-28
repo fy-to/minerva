@@ -14,6 +14,7 @@ type ITask interface {
 	MarkAsSuccess()
 	MarkAsFailed(err error)
 	GetPriority() int
+	GetID() string
 	GetMaxRetries() int
 	GetRetries() int
 	GetCreatedAt() time.Time
@@ -111,6 +112,18 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 
 	return tm
 }
+func (m *TaskQueueManager) HasTaskInQueue(task ITask) bool {
+	providerName := task.GetProvider().Name()
+	server := m.selectServerWithLowestQueue(providerName)
+	m.lock[providerName].Lock()
+	defer m.lock[providerName].Unlock()
+	for _, taskPriority := range *m.queues[providerName][server] {
+		if taskPriority.task.GetID() == task.GetID() {
+			return true
+		}
+	}
+	return false
+}
 
 func (m *TaskQueueManager) Start(tasks []ITask) {
 	for providerName, serverMap := range m.queues {
@@ -130,6 +143,11 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	if _, ok := m.queues[providerName]; !ok {
 		m.logger.Error().Msgf("[minerva|%s] Invalid provider", providerName)
 		task.MarkAsFailed(errors.New("invalid provider"))
+		return
+	}
+
+	if m.HasTaskInQueue(task) {
+		m.logger.Info().Msgf("[minerva|%s] Task already in queue", providerName)
 		return
 	}
 
