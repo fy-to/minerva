@@ -181,7 +181,6 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 
 			if err := m.handleTask(task, providerName, server); err != nil {
 				m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
-				m.AddTask(task) // Requeue task if handling fails and not exceeded retries
 			}
 		}
 	}
