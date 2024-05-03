@@ -25,6 +25,7 @@ type ITask interface {
 	UpdateLastError(string) error
 	OnComplete()
 	OnStart()
+	GetMutex() *sync.Mutex
 }
 
 type ITaskGroup interface {
@@ -32,6 +33,7 @@ type ITaskGroup interface {
 	GetTaskCount() int
 	GetTaskCompletedCount() int
 	UpdateTaskCompletedCount(int) error
+	GetMutex() *sync.Mutex
 }
 
 type IProvider interface {
@@ -136,7 +138,15 @@ func (m *TaskQueueManager) Start(tasks []ITask) {
 		m.AddTask(task)
 	}
 }
-
+func (m *TaskQueueManager) GetTotalTasks() int {
+	totalTasks := 0
+	for _, serverMap := range m.queueSizes {
+		for _, queueSize := range serverMap {
+			totalTasks += queueSize
+		}
+	}
+	return totalTasks
+}
 func (m *TaskQueueManager) AddTask(task ITask) {
 	providerName := task.GetProvider().Name()
 
