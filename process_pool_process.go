@@ -191,7 +191,6 @@ func (p *Process) Communicate(cmd map[string]interface{}) (map[string]interface{
 			select {
 			case <-ctx.Done():
 				errChan <- errors.New("communication timed out")
-				p.Restart()
 				return
 			default:
 				line, err := p.stdout.ReadString('\n')

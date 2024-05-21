@@ -189,9 +189,12 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 			m.queueSizes[providerName][server]--
 			m.lock[providerName].Unlock()
 
-			if err := m.handleTask(task, providerName, server); err != nil {
-				m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
-			}
+			// Ensure handleTask is called within a separate goroutine to prevent blocking.
+			go func() {
+				if err := m.handleTask(task, providerName, server); err != nil {
+					m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+				}
+			}()
 		}
 	}
 }
