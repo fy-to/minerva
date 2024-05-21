@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -269,32 +268,8 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 	task.OnStart()
 
-	ctx, cancel := context.WithTimeout(context.Background(), task.GetTimeout())
-	defer cancel()
-
-	err := func() error {
-		done := make(chan error, 1)
-		go func() {
-			done <- task.GetProvider().Handle(task, server)
-		}()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-done:
-			return err
-		}
-	}()
-
+	err := task.GetProvider().Handle(task, server)
 	if err != nil {
-		wrappedErr := fmt.Errorf("[minerva|%s|%s] %v", providerName, server, err)
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			m.logger.Error().Err(wrappedErr).Msg("Task handling exceeded timeout")
-		} else {
-			m.logger.Error().Err(wrappedErr).Msg("Failed to handle task")
-		}
-
 		task.UpdateLastError(err.Error())
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
@@ -305,7 +280,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		}
 		task.UpdateRetries(retries + 1)
 		m.AddTask(task)
-		return wrappedErr
+		return err
 	}
 
 	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
