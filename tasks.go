@@ -264,6 +264,13 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 			m.logger.Error().Msgf("[minerva|%s|%s] Recovered from panic: %v", providerName, server, r)
 		}
 	}()
+	taskMutex := task.GetMutex()
+	taskMutex.Lock()
+	defer taskMutex.Unlock()
+	if task.GetTaskGroup() != nil {
+		task.GetTaskGroup().GetMutex().Lock()
+		defer task.GetTaskGroup().GetMutex().Unlock()
+	}
 
 	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 	task.OnStart()
