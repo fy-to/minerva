@@ -25,7 +25,6 @@ type ITask interface {
 	UpdateLastError(string) error
 	OnComplete()
 	OnStart()
-	GetMutex() *sync.Mutex
 }
 
 type ITaskGroup interface {
@@ -33,7 +32,6 @@ type ITaskGroup interface {
 	GetTaskCount() int
 	GetTaskCompletedCount() int
 	UpdateTaskCompletedCount(int) error
-	GetMutex() *sync.Mutex
 }
 
 type IProvider interface {
@@ -222,9 +220,7 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 			taskPriority := heap.Pop(m.queues[providerName][server]).(*TaskPriority)
 			task := taskPriority.task
 			m.queueSizes[providerName][server]--
-			m.inProgressTasksMutex.Lock()
-			delete(m.inProgressTasks, task.GetID())
-			m.inProgressTasksMutex.Unlock()
+
 			m.lock[providerName].Unlock()
 
 			// Ensure handleTask is called within a separate goroutine to prevent blocking.
@@ -264,13 +260,6 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 			m.logger.Error().Msgf("[minerva|%s|%s] Recovered from panic: %v", providerName, server, r)
 		}
 	}()
-	taskMutex := task.GetMutex()
-	taskMutex.Lock()
-	defer taskMutex.Unlock()
-	if task.GetTaskGroup() != nil {
-		task.GetTaskGroup().GetMutex().Lock()
-		defer task.GetTaskGroup().GetMutex().Unlock()
-	}
 
 	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 	task.OnStart()
@@ -286,8 +275,15 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 			return nil
 		}
 		task.UpdateRetries(retries + 1)
+		m.inProgressTasksMutex.Lock()
+		delete(m.inProgressTasks, task.GetID())
+		m.inProgressTasksMutex.Unlock()
 		m.AddTask(task)
 		return err
+	} else {
+		m.inProgressTasksMutex.Lock()
+		delete(m.inProgressTasks, task.GetID())
+		m.inProgressTasksMutex.Unlock()
 	}
 
 	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
