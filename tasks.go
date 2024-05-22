@@ -32,7 +32,6 @@ type ITaskGroup interface {
 	GetTaskCount() int
 	GetTaskCompletedCount() int
 	UpdateTaskCompletedCount(int) error
-	GetMutex() *sync.Mutex
 }
 
 type IProvider interface {
@@ -89,9 +88,13 @@ type TaskQueueManager struct {
 	queueCond            map[string]*sync.Cond
 	queueLock            map[string]*sync.Mutex
 	shutdownMutex        sync.Mutex
+	shouldRestart        bool
+	maxTimeForTask       time.Duration
+	selfLock             sync.Mutex
+	initServerMap        map[string][]string
 }
 
-func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string) *TaskQueueManager {
+func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string, maxTime time.Duration) *TaskQueueManager {
 	tm := &TaskQueueManager{
 		queues:               make(map[string]map[string]*PriorityQueue),
 		lock:                 make(map[string]*sync.Mutex),
@@ -105,8 +108,15 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 		inProgressTasksMutex: sync.Mutex{},
 		inProgressTasks:      make(map[string]bool),
 		shutdownMutex:        sync.Mutex{},
+		maxTimeForTask:       maxTime,
+		selfLock:             sync.Mutex{},
+		shouldRestart:        false,
+		initServerMap:        servers,
 	}
-
+	tm.selfLock.Lock()
+	defer tm.selfLock.Unlock()
+	tm.shutdownMutex.Lock()
+	defer tm.shutdownMutex.Unlock()
 	for _, provider := range *providers {
 		tm.queues[provider.Name()] = make(map[string]*PriorityQueue)
 		tm.queueSizes[provider.Name()] = make(map[string]int)
@@ -124,6 +134,16 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 	}
 
 	return tm
+}
+func (m *TaskQueueManager) GetShouldRestart() bool {
+	m.selfLock.Lock()
+	defer m.selfLock.Unlock()
+	return m.shouldRestart
+}
+func (m *TaskQueueManager) SetShouldRestart(shouldRestart bool) {
+	m.selfLock.Lock()
+	defer m.selfLock.Unlock()
+	m.shouldRestart = shouldRestart
 }
 func (m *TaskQueueManager) HasTaskInQueue(task ITask) bool {
 	taskID := task.GetID()
@@ -232,6 +252,16 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 	}
 }
 
+func (m *TaskQueueManager) Restart(tasks []ITask) {
+	m.SetShouldRestart(false)
+	m.logger.Warn().Msg("Restarting task queue manager")
+	m.selfLock.Lock()
+	defer m.selfLock.Unlock()
+	m.Shutdown()
+	m = NewTaskQueueManager(m.logger, m.providers, m.initServerMap, m.maxTimeForTask)
+	m.Start(tasks)
+}
+
 func (m *TaskQueueManager) handleTaskWithTimeout(task ITask, providerName, server string) error {
 	timeout := task.GetTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -239,7 +269,14 @@ func (m *TaskQueueManager) handleTaskWithTimeout(task ITask, providerName, serve
 	// Create a channel to signal completion (or error)
 	done := make(chan error, 1)
 	go func() {
-		done <- m.handleTask(task, providerName, server)
+		startTime := time.Now()
+		result := m.handleTask(task, providerName, server)
+		elapsed := time.Since(startTime)
+		if elapsed > m.maxTimeForTask {
+			m.logger.Warn().Msgf("[minerva|%s|%s] Task took too long to process: %s", providerName, server, elapsed)
+			m.SetShouldRestart(true)
+		}
+		done <- result
 	}()
 
 	// Wait for either the task to complete or the context to expire
@@ -282,26 +319,15 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		m.AddTask(task)
 		return err
 	} else {
-
-		m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
-		if task.GetTaskGroup() != nil {
-			mtx := task.GetTaskGroup().GetMutex()
-			mtx.Lock()
-			task.MarkAsSuccess()
-			task.OnComplete()
-			m.inProgressTasksMutex.Lock()
-			delete(m.inProgressTasks, task.GetID())
-			m.inProgressTasksMutex.Unlock()
-			mtx.Unlock()
-		} else {
-			task.MarkAsSuccess()
-			task.OnComplete()
-			m.inProgressTasksMutex.Lock()
-			delete(m.inProgressTasks, task.GetID())
-			m.inProgressTasksMutex.Unlock()
-		}
-		return nil
+		m.inProgressTasksMutex.Lock()
+		delete(m.inProgressTasks, task.GetID())
+		m.inProgressTasksMutex.Unlock()
 	}
+
+	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
+	task.MarkAsSuccess()
+	task.OnComplete()
+	return nil
 }
 
 func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) string {
@@ -317,6 +343,26 @@ func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) stri
 }
 
 func (m *TaskQueueManager) Shutdown() {
-	close(m.shutdownCh)
-	m.wg.Wait()
+	m.shutdownMutex.Lock() // Lock to prevent concurrent Shutdown calls
+	defer m.shutdownMutex.Unlock()
+
+	// Check if already shutting down
+	select {
+	case <-m.shutdownCh:
+		return // Already shutting down
+	default:
+	}
+
+	close(m.shutdownCh) // Signal shutdown to worker goroutines
+
+	// Broadcast to all queue conditions to wake up any waiting goroutines
+	for _, cond := range m.cond {
+		cond.Broadcast()
+	}
+
+	for server := range m.queueCond {
+		m.queueCond[server].Broadcast() // Wake goroutines waiting on queue conditions
+	}
+
+	m.wg.Wait() // Wait for all worker goroutines to finish
 }
