@@ -32,6 +32,7 @@ type ITaskGroup interface {
 	GetTaskCount() int
 	GetTaskCompletedCount() int
 	UpdateTaskCompletedCount(int) error
+	GetMutex() *sync.Mutex
 }
 
 type IProvider interface {
@@ -281,15 +282,26 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		m.AddTask(task)
 		return err
 	} else {
-		m.inProgressTasksMutex.Lock()
-		delete(m.inProgressTasks, task.GetID())
-		m.inProgressTasksMutex.Unlock()
-	}
 
-	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
-	task.MarkAsSuccess()
-	task.OnComplete()
-	return nil
+		m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
+		if task.GetTaskGroup() != nil {
+			mtx := task.GetTaskGroup().GetMutex()
+			mtx.Lock()
+			task.MarkAsSuccess()
+			task.OnComplete()
+			m.inProgressTasksMutex.Lock()
+			delete(m.inProgressTasks, task.GetID())
+			m.inProgressTasksMutex.Unlock()
+			mtx.Unlock()
+		} else {
+			task.MarkAsSuccess()
+			task.OnComplete()
+			m.inProgressTasksMutex.Lock()
+			delete(m.inProgressTasks, task.GetID())
+			m.inProgressTasksMutex.Unlock()
+		}
+		return nil
+	}
 }
 
 func (m *TaskQueueManager) selectServerWithLowestQueue(providerName string) string {
