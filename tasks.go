@@ -201,7 +201,7 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	// Lock for inProgressTasks operations
 	m.inProgressTasksMutex.Lock()
 	if m.HasTaskInQueue(task) {
-		m.logger.Info().Msgf("[minerva|%s] Task already in queue or being processed", providerName)
+		m.logger.Warn().Msgf("[minerva|%s] Task already in queue or being processed", providerName)
 		m.inProgressTasksMutex.Unlock() // Unlock before returning
 		return
 	}
@@ -215,11 +215,11 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	m.queueSizes[providerName][server]++
 	m.queueLock[server].Unlock()
 	m.cond[providerName].Broadcast()
-	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
+	m.logger.Warn().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
 }
 
 func (m *TaskQueueManager) processQueue(providerName, server string) {
-	m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
+	m.logger.Warn().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
 	defer m.wg.Done()
 	for {
 		select {
@@ -299,7 +299,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		}
 	}()
 
-	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
+	m.logger.Warn().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 	task.OnStart()
 
 	err := task.GetProvider().Handle(task, server)
@@ -324,7 +324,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		m.inProgressTasksMutex.Unlock()
 	}
 
-	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
+	m.logger.Warn().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
 	task.MarkAsSuccess()
 	task.OnComplete()
 	return nil
