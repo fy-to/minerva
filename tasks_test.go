@@ -90,7 +90,7 @@ func TestTaskQueueManager(t *testing.T) {
 	}
 
 	manager := NewTaskQueueManager(&logger, &[]IProvider{
-		mockProvider1, mockProvider2}, servers, 2*time.Second)
+		mockProvider1, mockProvider2}, servers, 2*time.Second, true)
 
 	var tasks []ITask
 
