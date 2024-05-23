@@ -92,9 +92,10 @@ type TaskQueueManager struct {
 	maxTimeForTask       time.Duration
 	selfLock             sync.Mutex
 	initServerMap        map[string][]string
+	handleTimeout        bool
 }
 
-func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string, maxTime time.Duration) *TaskQueueManager {
+func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers map[string][]string, maxTime time.Duration, handleTimeout bool) *TaskQueueManager {
 	tm := &TaskQueueManager{
 		queues:               make(map[string]map[string]*PriorityQueue),
 		lock:                 make(map[string]*sync.Mutex),
@@ -112,6 +113,7 @@ func NewTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, servers
 		selfLock:             sync.Mutex{},
 		shouldRestart:        false,
 		initServerMap:        servers,
+		handleTimeout:        handleTimeout,
 	}
 	tm.selfLock.Lock()
 	defer tm.selfLock.Unlock()
@@ -215,11 +217,11 @@ func (m *TaskQueueManager) AddTask(task ITask) {
 	m.queueSizes[providerName][server]++
 	m.queueLock[server].Unlock()
 	m.cond[providerName].Broadcast()
-	m.logger.Warn().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
+	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
 }
 
 func (m *TaskQueueManager) processQueue(providerName, server string) {
-	m.logger.Warn().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
+	m.logger.Info().Msgf("[minerva|%s|%s] Starting queue processor", providerName, server)
 	defer m.wg.Done()
 	for {
 		select {
@@ -245,8 +247,14 @@ func (m *TaskQueueManager) processQueue(providerName, server string) {
 			m.lock[providerName].Unlock()
 
 			// Ensure handleTask is called within a separate goroutine to prevent blocking.
-			if err := m.handleTaskWithTimeout(task, providerName, server); err != nil {
-				m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+			if m.handleTimeout {
+				if err := m.handleTaskWithTimeout(task, providerName, server); err != nil {
+					m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+				}
+			} else {
+				if err := m.handleTask(task, providerName, server); err != nil {
+					m.logger.Error().Err(err).Msgf("[minerva|%s|%s] Failed to handle task", providerName, server)
+				}
 			}
 		}
 	}
@@ -258,7 +266,7 @@ func (m *TaskQueueManager) Restart(tasks []ITask) {
 	m.selfLock.Lock()
 	defer m.selfLock.Unlock()
 	m.Shutdown()
-	m = NewTaskQueueManager(m.logger, m.providers, m.initServerMap, m.maxTimeForTask)
+	m = NewTaskQueueManager(m.logger, m.providers, m.initServerMap, m.maxTimeForTask, m.handleTimeout)
 	m.Start(tasks)
 }
 
@@ -324,7 +332,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		m.inProgressTasksMutex.Unlock()
 	}
 
-	m.logger.Warn().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
+	m.logger.Info().Msgf("[minerva|%s|%s] Task handled successfully", providerName, server)
 	task.MarkAsSuccess()
 	task.OnComplete()
 	return nil
