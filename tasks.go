@@ -189,35 +189,57 @@ func (m *TaskQueueManager) GetTotalTasks() int {
 	}
 	return totalTasks
 }
-func (m *TaskQueueManager) AddTask(task ITask) {
-	providerName := task.GetProvider().Name()
-	m.lock[providerName].Lock()
-	defer m.lock[providerName].Unlock()
+func (m *TaskQueueManager) AddTask(task ITask) error {
 
-	if _, ok := m.queues[providerName]; !ok {
-		m.logger.Error().Msgf("[minerva|%s] Invalid provider", providerName)
-		task.MarkAsFailed(errors.New("invalid provider"))
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+
+		providerName := task.GetProvider().Name()
+		m.lock[providerName].Lock()
+		defer m.lock[providerName].Unlock()
+
+		if _, ok := m.queues[providerName]; !ok {
+			m.logger.Error().Msgf("[minerva|%s] Invalid provider", providerName)
+			task.MarkAsFailed(errors.New("invalid provider"))
+			done <- errors.New("invalid provider")
+			return
+		}
+
+		// Lock for inProgressTasks operations
+		m.inProgressTasksMutex.Lock()
+		if m.HasTaskInQueue(task) {
+			m.logger.Warn().Msgf("[minerva|%s] Task already in queue or being processed", providerName)
+			m.inProgressTasksMutex.Unlock() // Unlock before returning
+			done <- errors.New("task already in queue or being processed")
+			return
+		}
+		m.inProgressTasks[task.GetID()] = true
+		m.inProgressTasksMutex.Unlock()
+
+		server := m.selectServerWithLowestQueue(providerName)
+		m.queueLock[server].Lock()
+		heap.Push(m.queues[providerName][server], &TaskPriority{task: task, priority: task.GetPriority()})
+		queueSize := m.queueSizes[providerName][server]
+		m.queueSizes[providerName][server]++
+		m.queueLock[server].Unlock()
+		m.cond[providerName].Broadcast()
+		m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
+		done <- nil
 		return
-	}
+	}()
 
-	// Lock for inProgressTasks operations
-	m.inProgressTasksMutex.Lock()
-	if m.HasTaskInQueue(task) {
-		m.logger.Warn().Msgf("[minerva|%s] Task already in queue or being processed", providerName)
-		m.inProgressTasksMutex.Unlock() // Unlock before returning
-		return
+	select {
+	case <-ctx.Done():
+		cancel()
+		m.logger.Error().Msgf("[minerva|%s|%s] Timed out while adding task to queue", task.GetProvider().Name(), task.GetID())
+		m.SetShouldRestart(true)
+		return ctx.Err()
+	case err := <-done:
+		cancel()
+		return err
 	}
-	m.inProgressTasks[task.GetID()] = true
-	m.inProgressTasksMutex.Unlock()
-
-	server := m.selectServerWithLowestQueue(providerName)
-	m.queueLock[server].Lock()
-	heap.Push(m.queues[providerName][server], &TaskPriority{task: task, priority: task.GetPriority()})
-	queueSize := m.queueSizes[providerName][server]
-	m.queueSizes[providerName][server]++
-	m.queueLock[server].Unlock()
-	m.cond[providerName].Broadcast()
-	m.logger.Info().Msgf("[minerva|%s|%s] Task added to queue (queue size: %d)", providerName, server, queueSize)
 }
 
 func (m *TaskQueueManager) processQueue(providerName, server string) {
