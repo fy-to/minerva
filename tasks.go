@@ -307,7 +307,7 @@ func (m *TaskQueueManager) handleTask(task ITask, providerName, server string) e
 		}
 	}()
 
-	m.logger.Warn().Msgf("[minerva|%s|%s] Handling task", providerName, server)
+	m.logger.Info().Msgf("[minerva|%s|%s] Handling task", providerName, server)
 	task.OnStart()
 
 	err := task.GetProvider().Handle(task, server)
