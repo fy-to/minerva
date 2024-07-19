@@ -23,6 +23,7 @@ type Process struct {
 	logger          *zerolog.Logger
 	stdin           *json.Encoder
 	stdout          *bufio.Reader
+	stderr          *bufio.Reader
 	name            string
 	cmdStr          string
 	cmdArgs         []string
@@ -59,14 +60,21 @@ func (p *Process) Start() {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to get stdout pipe for process", p.name)
 		return
 	}
-
+	stderr, err := _cmd.StderrPipe() // Capture stderr pipe
+	if err != nil {
+		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to get stderr pipe for process", p.name)
+		return
+	}
 	p.mutex.Lock()
 	p.cmd = _cmd
 	p.stdin = json.NewEncoder(stdin)
 	p.stdout = bufio.NewReader(stdout)
+	p.stderr = bufio.NewReader(stderr)
+
 	p.mutex.Unlock()
 	p.cmd.Dir = p.cwd
 	go p.WaitForReadyScan()
+	go p.readStderr()
 	if err := p.cmd.Start(); err != nil {
 		p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to start process", p.name)
 		return
@@ -89,6 +97,7 @@ func (p *Process) cleanupChannelsAndResources() {
 	p.cmd = nil
 	p.stdin = nil
 	p.stdout = nil
+	p.stderr = nil
 	p.mutex.Unlock()
 }
 
@@ -122,7 +131,18 @@ func (p *Process) IsBusy() bool {
 func (p *Process) SetBusy(busy int32) {
 	atomic.StoreInt32(&p.isBusy, busy)
 }
-
+func (p *Process) readStderr() {
+	for {
+		line, err := p.stderr.ReadString('\n')
+		if err != nil {
+			p.logger.Error().Err(err).Msgf("[minerva|%s] Failed to read stderr", p.name)
+			return
+		}
+		if line != "" && line != "\n" {
+			p.logger.Error().Msgf("[minerva|%s|stderr] %s", p.name, line)
+		}
+	}
+}
 func (p *Process) WaitForReadyScan() {
 	responseChan := make(chan map[string]interface{}, 1)
 	errChan := make(chan error, 1)
